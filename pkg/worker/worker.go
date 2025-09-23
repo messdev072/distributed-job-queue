@@ -26,12 +26,20 @@ func (w *Worker) Start() {
 		fmt.Printf("[Worker] Processing job %s: %s\n", job.ID, job.Payload)
 		if err := w.Handler(job); err != nil {
 			fmt.Printf("[Worker] Job %s failed: %v\n", job.ID, err)
-			job.Status = queue.StatusFailed
+			_ = w.Q.Fail(job, err.Error())
 		} else {
-			fmt.Printf("[Worker] Job %s completed successfully\n", job.ID)
-			job.Status = queue.StatusCompleted
+			fmt.Printf("[Worker] Job %s completed\n", job.ID)
+			_ = w.Q.Ack(job)
 		}
 		job.UpdatedAt = time.Now()
 		_ = w.Q.UpdateJob(job)
+
+		// Requeue expired jobs
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			for range ticker.C {
+				_ = w.Q.RequeueExpired()
+			}
+		}()
 	}
 }
