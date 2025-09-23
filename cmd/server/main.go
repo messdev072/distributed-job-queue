@@ -20,6 +20,7 @@ func main() {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	})
 	http.HandleFunc("/jobs/", s.GetJobHandler)
+	http.HandleFunc("/workers", s.ListWorkersHandler)
 
 	log.Println("Starting server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))

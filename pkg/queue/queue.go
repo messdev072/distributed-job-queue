@@ -8,12 +8,12 @@ import (
 
 type Queue interface {
 	Enqueue(job *Job) error
-	Dequeue() (*Job, error)
+	Dequeue(queueName string) (*Job, error)
 	Ack(job *Job) error
 	Fail(job *Job, reason string) error
 	GetJob(id string) (*Job, error)
 	UpdateJob(job *Job) error
-	RequeueExpired() error // Requeue jobs that have been running too long
+	RequeueExpired(queueName string) error // Requeue jobs that have been running too long
 	Client() *redis.Client
 	Ctx() context.Context
 }

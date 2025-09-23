@@ -7,13 +7,39 @@ import (
 )
 
 type Worker struct {
-	Q       queue.Queue
-	Handler func(job *queue.Job) error
+	ID        string
+	Queue     queue.Queue
+	QueueName string
+	Handler   func(job *queue.Job) error
+	Registry  *Registry
 }
 
 func (w *Worker) Start() {
+	// Defaults
+	if w.QueueName == "" {
+		w.QueueName = "default"
+	}
+	if w.ID == "" {
+		w.ID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	if w.Registry == nil && w.Queue != nil {
+		w.Registry = NewRegistryFromQueue(w.Queue, w.ID)
+	}
+	if w.Registry != nil {
+		w.Registry.StartHeartbeat()
+	}
+
+	// Periodic maintenance: requeue expired
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		for range ticker.C {
+			_ = w.Queue.RequeueExpired(w.QueueName)
+		}
+	}()
+
+	// Main worker loop
 	for {
-		job, err := w.Q.Dequeue()
+		job, err := w.Queue.Dequeue(w.QueueName)
 		if err != nil {
 			time.Sleep(time.Second) // nothing to do, backoff
 			continue
@@ -21,25 +47,19 @@ func (w *Worker) Start() {
 
 		job.Status = queue.StatusRunning
 		job.UpdatedAt = time.Now()
-		_ = w.Q.UpdateJob(job)
+		_ = w.Queue.UpdateJob(job)
 
 		fmt.Printf("[Worker] Processing job %s: %s\n", job.ID, job.Payload)
 		if err := w.Handler(job); err != nil {
 			fmt.Printf("[Worker] Job %s failed: %v\n", job.ID, err)
-			_ = w.Q.Fail(job, err.Error())
+			_ = w.Queue.Fail(job, err.Error())
 		} else {
 			fmt.Printf("[Worker] Job %s completed\n", job.ID)
-			_ = w.Q.Ack(job)
+			_ = w.Queue.Ack(job)
 		}
 		job.UpdatedAt = time.Now()
-		_ = w.Q.UpdateJob(job)
+		_ = w.Queue.UpdateJob(job)
 
-		// Requeue expired jobs
-		go func() {
-			ticker := time.NewTicker(15 * time.Second)
-			for range ticker.C {
-				_ = w.Q.RequeueExpired()
-			}
-		}()
+		// Next loop iteration
 	}
 }

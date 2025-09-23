@@ -11,7 +11,7 @@ func main() {
 	q := storage.NewRedisQueue("localhost:6379", "jobs")
 
 	w := &worker.Worker{
-		Q: q,
+		Queue: q,
 		Handler: func(job *queue.Job) error {
 			// Replace with actual job logic
 			if job.Payload == "fail" {
