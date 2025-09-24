@@ -14,6 +14,7 @@ import (
 type RedisQueue struct {
 	client *redis.Client
 	ctx    context.Context
+	hooks  queue.LifecycleHooks
 }
 
 func NewRedisQueue(addr, queueName string) *RedisQueue {
@@ -23,8 +24,19 @@ func NewRedisQueue(addr, queueName string) *RedisQueue {
 	rq := &RedisQueue{
 		client: rdb,
 		ctx:    context.Background(),
+		hooks:  queue.NoopHooks{},
 	}
 	return rq
+}
+
+// WithHooks sets lifecycle hooks for this queue instance.
+func (r *RedisQueue) WithHooks(h queue.LifecycleHooks) *RedisQueue {
+	if h == nil {
+		r.hooks = queue.NoopHooks{}
+		return r
+	}
+	r.hooks = h
+	return r
 }
 
 func (r *RedisQueue) Enqueue(job *queue.Job) error {
@@ -41,10 +53,23 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 	if err := r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err(); err != nil {
 		return err
 	}
+	// track queue names in a Redis set for fast discovery
+	_ = r.client.SAdd(r.ctx, "queues", job.QueueName).Err()
+	// event: enqueued
+	_ = r.appendEvent(job.ID, map[string]interface{}{
+		"type":      "enqueued",
+		"queue":     job.QueueName,
+		"timestamp": time.Now().Unix(),
+	})
 	// update queue length metric
 	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
 	}
+	// fire hook asynchronously to avoid blocking enqueue path
+	go func(j *queue.Job) {
+		defer func() { _ = recover() }()
+		r.hooks.OnEnqueue(r.ctx, j)
+	}(job)
 	return nil
 }
 
@@ -69,6 +94,12 @@ func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
 	// ZSET for visibility timeout
 	_ = r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:processing", queueName), redis.Z{Score: float64(deadline), Member: job.ID}).Err()
 	// Note: ownership is assigned by the worker after Dequeue via job:ownership hash
+	// event: dequeued
+	_ = r.appendEvent(job.ID, map[string]interface{}{
+		"type":      "dequeued",
+		"queue":     queueName,
+		"timestamp": time.Now().Unix(),
+	})
 
 	job.Status = queue.StatusRunning
 	job.UpdatedAt = time.Now()
@@ -105,6 +136,12 @@ func (r *RedisQueue) Ack(job *queue.Job) error {
 	_ = r.client.HDel(r.ctx, "job:ownership", job.ID).Err()
 	job.Status = queue.StatusCompleted
 	job.UpdatedAt = time.Now()
+	// event: ack
+	_ = r.appendEvent(job.ID, map[string]interface{}{
+		"type":      "ack",
+		"queue":     job.QueueName,
+		"timestamp": time.Now().Unix(),
+	})
 	// record metrics
 	m.JobsProcessedTotal.WithLabelValues("success", job.QueueName).Inc()
 	m.ObserveJobCompletion(job.QueueName, job.CreatedAt)
@@ -112,6 +149,11 @@ func (r *RedisQueue) Ack(job *queue.Job) error {
 	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
 	}
+	// trigger hook (async, safe)
+	go func(j *queue.Job) {
+		defer func() { _ = recover() }()
+		r.hooks.OnAck(r.ctx, j)
+	}(job)
 	return r.UpdateJob(job)
 }
 
@@ -132,9 +174,19 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 		_ = r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s:dlq", job.QueueName), job.ID).Err()
 		// Also push to global DLQ key expected by tests
 		_ = r.client.LPush(r.ctx, "jobs:dlq", job.ID).Err()
+		_ = r.appendEvent(job.ID, map[string]interface{}{
+			"type":      "failed_terminal",
+			"queue":     job.QueueName,
+			"timestamp": time.Now().Unix(),
+		})
 		// metrics for failed terminal
 		m.JobsProcessedTotal.WithLabelValues("fail", job.QueueName).Inc()
 		m.ObserveJobCompletion(job.QueueName, job.CreatedAt)
+		// fire hook (async) for failure
+		go func(j *queue.Job, rsn string) {
+			defer func() { _ = recover() }()
+			r.hooks.OnFail(r.ctx, j, rsn)
+		}(job, reason)
 		return r.UpdateJob(job)
 	}
 
@@ -145,9 +197,24 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 	if err := r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err(); err != nil {
 		return err
 	}
+	// job has re-entered the queue; treat as enqueue for hooks
+	go func(j *queue.Job) {
+		defer func() { _ = recover() }()
+		r.hooks.OnEnqueue(r.ctx, j)
+	}(job)
+	_ = r.appendEvent(job.ID, map[string]interface{}{
+		"type":      "retry_scheduled",
+		"queue":     job.QueueName,
+		"timestamp": time.Now().Unix(),
+	})
 	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
 	}
+	// still a failure occurrence (for this attempt) trigger hook
+	go func(j *queue.Job, rsn string) {
+		defer func() { _ = recover() }()
+		r.hooks.OnFail(r.ctx, j, rsn)
+	}(job, reason)
 	return nil
 }
 
@@ -177,6 +244,11 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 				"status", queue.StatusPending,
 				"updated_at", time.Now().Unix(),
 			)
+			_ = r.appendEvent(jobID, map[string]interface{}{
+				"type":      "requeued_dead_worker",
+				"queue":     queueName,
+				"timestamp": time.Now().Unix(),
+			})
 		}
 	}
 
@@ -196,6 +268,11 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 			"status", queue.StatusPending,
 			"updated_at", time.Now().Unix(),
 		)
+		_ = r.appendEvent(jobID, map[string]interface{}{
+			"type":      "requeued_expired",
+			"queue":     queueName,
+			"timestamp": time.Now().Unix(),
+		})
 	}
 
 	// Also move ready delayed jobs back to the main queue if any
@@ -221,3 +298,18 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 
 func (rq *RedisQueue) Client() *redis.Client { return rq.client }
 func (rq *RedisQueue) Ctx() context.Context  { return rq.ctx }
+
+// appendEvent stores a JSON event in a capped list per job
+func (r *RedisQueue) appendEvent(jobID string, evt map[string]interface{}) error {
+	b, err := json.Marshal(evt)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("job:%s:events", jobID)
+	if err := r.client.LPush(r.ctx, key, string(b)).Err(); err != nil {
+		return err
+	}
+	// keep last 100
+	_ = r.client.LTrim(r.ctx, key, 0, 99).Err()
+	return nil
+}

@@ -4,8 +4,10 @@ import (
 	"distributed-job-queue/pkg/logging"
 	"distributed-job-queue/pkg/queue"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -68,4 +70,130 @@ func (s *Server) ListWorkersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	logging.L().Info("list workers", zap.Int("count", len(workers)), zap.String("job_id", ""), zap.String("queue", ""), zap.String("worker_id", ""))
 	json.NewEncoder(w).Encode(workers)
+}
+
+// GET /queues -> show queue lengths for all queues
+func (s *Server) ListQueuesHandler(w http.ResponseWriter, r *http.Request) {
+	resp := map[string]int64{}
+	queues, err := s.Q.Client().SMembers(s.Q.Ctx(), "queues").Result()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, q := range queues {
+		key := fmt.Sprintf("jobs:%s", q)
+		if n, err := s.Q.Client().LLen(s.Q.Ctx(), key).Result(); err == nil {
+			resp[q] = n
+		}
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// GET /jobs/:id -> detailed job info
+func (s *Server) GetJobDetailHandler(w http.ResponseWriter, r *http.Request) {
+	id := getJobIDFromPath(r.URL.Path)
+	if id == "" {
+		http.Error(w, "missing job ID", http.StatusBadRequest)
+		return
+	}
+	job, err := s.Q.GetJob(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	// fetch and parse limited history
+	rawEvents, _ := s.Q.Client().LRange(s.Q.Ctx(), fmt.Sprintf("job:%s:events", id), 0, 50).Result()
+	type Event struct {
+		Type      string `json:"type"`
+		Queue     string `json:"queue"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	parsed := make([]Event, 0, len(rawEvents))
+	for _, e := range rawEvents {
+		var ev Event
+		if err := json.Unmarshal([]byte(e), &ev); err == nil {
+			parsed = append(parsed, ev)
+		}
+	}
+	resp := map[string]interface{}{
+		"job":    job,
+		"events": parsed,
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// POST /jobs/:id/retry -> manually requeue a failed job
+func (s *Server) RetryJobHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := getJobIDFromPath(r.URL.Path)
+	if id == "" {
+		http.Error(w, "missing job ID", http.StatusBadRequest)
+		return
+	}
+	job, err := s.Q.GetJob(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	// Only requeue if failed/canceled
+	if job.Status != queue.StatusFailed && job.Status != queue.StatusCanceled {
+		http.Error(w, "job not in failed/canceled state", http.StatusBadRequest)
+		return
+	}
+	job.Status = queue.StatusPending
+	job.UpdatedAt = time.Now()
+	job.RetryCount = 0
+	_ = s.Q.UpdateJob(job)
+	_ = s.Q.Client().LPush(s.Q.Ctx(), fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err()
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// POST /jobs/:id/cancel -> mark job canceled
+func (s *Server) CancelJobHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := getJobIDFromPath(r.URL.Path)
+	if id == "" {
+		http.Error(w, "missing job ID", http.StatusBadRequest)
+		return
+	}
+	job, err := s.Q.GetJob(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	job.Status = queue.StatusCanceled
+	job.UpdatedAt = time.Now()
+	if err := s.Q.UpdateJob(job); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// getJobIDFromPath returns the job ID from URLs like /jobs/:id or /admin/jobs/:id/(action)
+func getJobIDFromPath(path string) string {
+	parts := strings.Split(path, "/")
+	segs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			segs = append(segs, p)
+		}
+	}
+	if len(segs) == 0 {
+		return ""
+	}
+	last := segs[len(segs)-1]
+	if last == "retry" || last == "cancel" {
+		if len(segs) >= 2 {
+			return segs[len(segs)-2]
+		}
+		return ""
+	}
+	return last
 }

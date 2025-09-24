@@ -13,6 +13,7 @@ const (
 	StatusRunning   Status = "RUNNING"
 	StatusCompleted Status = "COMPLETED"
 	StatusFailed    Status = "FAILED"
+	StatusCanceled  Status = "CANCELED"
 )
 
 type Job struct {
