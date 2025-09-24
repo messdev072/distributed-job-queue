@@ -159,3 +159,28 @@ func TestMultipleQueuesProcessIndependently(t *testing.T) {
 	assert.Equal(t, queue.StatusCompleted, upd1.Status)
 	assert.Equal(t, queue.StatusCompleted, upd2.Status)
 }
+
+func TestRecoverySweepDeadWorker(t *testing.T) {
+	q, name := newTestQueueWithName()
+
+	// Enqueue and dequeue a job to move it to processing
+	job := queue.NewJob("owned-by-dead-worker", name)
+	assert.NoError(t, q.Enqueue(job))
+	deq, err := q.Dequeue(name)
+	assert.NoError(t, err)
+	assert.Equal(t, job.ID, deq.ID)
+
+	// Simulate ownership by a worker and then simulate worker death by deleting heartbeat
+	workerID := fmt.Sprintf("dead-%d", time.Now().UnixNano())
+	_, _ = q.Client().HSet(q.Ctx(), "job:ownership", job.ID, workerID).Result()
+	// Ensure no heartbeat exists for the worker (delete just in case)
+	_, _ = q.Client().Del(q.Ctx(), fmt.Sprintf("worker:%s", workerID)).Result()
+
+	// Run recovery sweep — should requeue immediately due to missing heartbeat
+	assert.NoError(t, q.RequeueExpired(name))
+
+	// Now the job should be back in the queue and dequeuable again
+	requeued, err := q.Dequeue(name)
+	assert.NoError(t, err)
+	assert.Equal(t, job.ID, requeued.ID)
+}

@@ -58,7 +58,9 @@ func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
 
 	// Mark as processing with a short visibility timeout so tests can expire it
 	deadline := time.Now().Add(1 * time.Second).Unix()
+	// ZSET for visibility timeout
 	_ = r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:processing", queueName), redis.Z{Score: float64(deadline), Member: job.ID}).Err()
+	// Note: ownership is assigned by the worker after Dequeue via job:ownership hash
 
 	job.Status = queue.StatusRunning
 	job.UpdatedAt = time.Now()
@@ -91,6 +93,8 @@ func (r *RedisQueue) UpdateJob(job *queue.Job) error {
 func (r *RedisQueue) Ack(job *queue.Job) error {
 	// Remove from processing set
 	_ = r.client.ZRem(r.ctx, fmt.Sprintf("jobs:%s:processing", job.QueueName), job.ID).Err()
+	// Clear ownership
+	_ = r.client.HDel(r.ctx, "job:ownership", job.ID).Err()
 	job.Status = queue.StatusCompleted
 	job.UpdatedAt = time.Now()
 	return r.UpdateJob(job)
@@ -102,6 +106,8 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 
 	// Remove from processing set if present
 	_ = r.client.ZRem(r.ctx, fmt.Sprintf("jobs:%s:processing", job.QueueName), job.ID).Err()
+	// Clear ownership on failure handling as it will be requeued or sent to DLQ
+	_ = r.client.HDel(r.ctx, "job:ownership", job.ID).Err()
 
 	// Always mark as failed for this attempt
 	job.Status = queue.StatusFailed
@@ -125,6 +131,30 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 	now := time.Now().Unix()
 	procKey := fmt.Sprintf("jobs:%s:processing", queueName)
 	queueKey := fmt.Sprintf("jobs:%s", queueName)
+
+	// First, recover jobs owned by dead workers regardless of score
+	// Fetch all ownerships to find jobs for which the worker heartbeat is missing.
+	owners, _ := r.client.HGetAll(r.ctx, "job:ownership").Result()
+	for jobID, workerID := range owners {
+		// Check that this job is in this queue's processing set
+		if _, err := r.client.ZScore(r.ctx, procKey, jobID).Result(); err != nil {
+			// not in this queue's processing, skip
+			continue
+		}
+		// Check if worker:<id> exists
+		exists, _ := r.client.Exists(r.ctx, fmt.Sprintf("worker:%s", workerID)).Result()
+		if exists == 0 {
+			// dead worker: move job back to queue and clear from processing and ownership
+			_ = r.client.ZRem(r.ctx, procKey, jobID).Err()
+			_ = r.client.HDel(r.ctx, "job:ownership", jobID).Err()
+			_ = r.client.LPush(r.ctx, queueKey, jobID).Err()
+			// Update job status in hash
+			r.client.HSet(r.ctx, fmt.Sprintf("job:%s", jobID),
+				"status", queue.StatusPending,
+				"updated_at", time.Now().Unix(),
+			)
+		}
+	}
 
 	expired, err := r.client.ZRangeByScore(r.ctx, procKey, &redis.ZRangeBy{
 		Min: "-inf",
