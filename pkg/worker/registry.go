@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	m "distributed-job-queue/pkg/metrics"
 	"distributed-job-queue/pkg/queue"
 	"fmt"
 	"os"
@@ -61,6 +62,7 @@ func (r *Registry) StartHeartbeat() {
 			}
 			r.client.HSet(ctx, fmt.Sprintf("worker:%s", r.id), data)
 			r.client.Expire(ctx, fmt.Sprintf("worker:%s", r.id), 10*time.Second)
+			m.WorkerHeartbeatsTotal.Inc()
 			time.Sleep(5 * time.Second)
 		}
 	}()

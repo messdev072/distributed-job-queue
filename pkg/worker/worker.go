@@ -1,9 +1,12 @@
 package worker
 
 import (
+	"distributed-job-queue/pkg/logging"
+	m "distributed-job-queue/pkg/metrics"
 	"distributed-job-queue/pkg/queue"
-	"fmt"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 type Worker struct {
@@ -20,7 +23,7 @@ func (w *Worker) Start() {
 		w.QueueName = "default"
 	}
 	if w.ID == "" {
-		w.ID = fmt.Sprintf("%d", time.Now().UnixNano())
+		w.ID = time.Now().Format("20060102150405.000000000")
 	}
 	if w.Registry == nil && w.Queue != nil {
 		w.Registry = NewRegistryFromQueue(w.Queue, w.ID)
@@ -52,13 +55,30 @@ func (w *Worker) Start() {
 		job.UpdatedAt = time.Now()
 		_ = w.Queue.UpdateJob(job)
 
-		fmt.Printf("[Worker] Processing job %s: %s\n", job.ID, job.Payload)
+		logging.L().Info("processing job",
+			zap.String("job_id", job.ID),
+			zap.String("queue", w.QueueName),
+			zap.String("worker_id", w.ID),
+		)
 		if err := w.Handler(job); err != nil {
-			fmt.Printf("[Worker] Job %s failed: %v\n", job.ID, err)
+			logging.L().Error("job failed",
+				zap.String("job_id", job.ID),
+				zap.String("queue", w.QueueName),
+				zap.String("worker_id", w.ID),
+				zap.Error(err),
+			)
 			_ = w.Queue.Fail(job, err.Error())
+			m.JobsProcessedTotal.WithLabelValues("fail", w.QueueName).Inc()
+			m.ObserveJobCompletion(w.QueueName, job.CreatedAt)
 		} else {
-			fmt.Printf("[Worker] Job %s completed\n", job.ID)
+			logging.L().Info("job completed",
+				zap.String("job_id", job.ID),
+				zap.String("queue", w.QueueName),
+				zap.String("worker_id", w.ID),
+			)
 			_ = w.Queue.Ack(job)
+			m.JobsProcessedTotal.WithLabelValues("success", w.QueueName).Inc()
+			m.ObserveJobCompletion(w.QueueName, job.CreatedAt)
 		}
 		job.UpdatedAt = time.Now()
 		_ = w.Queue.UpdateJob(job)

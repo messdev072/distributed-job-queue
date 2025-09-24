@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	m "distributed-job-queue/pkg/metrics"
 	"distributed-job-queue/pkg/queue"
 	"encoding/json"
 	"fmt"
@@ -37,7 +38,14 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 	}
 
 	// push to list
-	return r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err()
+	if err := r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err(); err != nil {
+		return err
+	}
+	// update queue length metric
+	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
+		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
+	}
+	return nil
 }
 
 func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
@@ -97,6 +105,13 @@ func (r *RedisQueue) Ack(job *queue.Job) error {
 	_ = r.client.HDel(r.ctx, "job:ownership", job.ID).Err()
 	job.Status = queue.StatusCompleted
 	job.UpdatedAt = time.Now()
+	// record metrics
+	m.JobsProcessedTotal.WithLabelValues("success", job.QueueName).Inc()
+	m.ObserveJobCompletion(job.QueueName, job.CreatedAt)
+	// update queue length metric
+	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
+		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
+	}
 	return r.UpdateJob(job)
 }
 
@@ -117,6 +132,9 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 		_ = r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s:dlq", job.QueueName), job.ID).Err()
 		// Also push to global DLQ key expected by tests
 		_ = r.client.LPush(r.ctx, "jobs:dlq", job.ID).Err()
+		// metrics for failed terminal
+		m.JobsProcessedTotal.WithLabelValues("fail", job.QueueName).Inc()
+		m.ObserveJobCompletion(job.QueueName, job.CreatedAt)
 		return r.UpdateJob(job)
 	}
 
@@ -124,7 +142,13 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 	if err := r.UpdateJob(job); err != nil {
 		return err
 	}
-	return r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err()
+	if err := r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err(); err != nil {
+		return err
+	}
+	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
+		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
+	}
+	return nil
 }
 
 func (r *RedisQueue) RequeueExpired(queueName string) error {
@@ -185,6 +209,11 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 	for _, jobID := range readyDelayed {
 		_ = r.client.ZRem(r.ctx, fmt.Sprintf("jobs:%s:delayed", queueName), jobID).Err()
 		_ = r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", queueName), jobID).Err()
+	}
+
+	// refresh queue length metric
+	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", queueName)).Result(); err == nil {
+		m.QueueLength.WithLabelValues(queueName).Set(float64(n))
 	}
 
 	return nil

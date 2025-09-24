@@ -1,6 +1,7 @@
 package main
 
 import (
+	"distributed-job-queue/pkg/logging"
 	"distributed-job-queue/pkg/queue"
 	"distributed-job-queue/pkg/storage"
 	"distributed-job-queue/pkg/worker"
@@ -8,6 +9,7 @@ import (
 )
 
 func main() {
+	_ = logging.Init(true)
 	q := storage.NewRedisQueue("localhost:6379", "jobs")
 
 	w := &worker.Worker{

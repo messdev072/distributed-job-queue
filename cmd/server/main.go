@@ -2,12 +2,16 @@ package main
 
 import (
 	"distributed-job-queue/pkg/api"
+	"distributed-job-queue/pkg/logging"
 	"distributed-job-queue/pkg/storage"
 	"log"
 	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
+	_ = logging.Init(true)
 	q := storage.NewRedisQueue("localhost:6379", "jobs")
 
 	s := &api.Server{Q: q}
@@ -20,6 +24,8 @@ func main() {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	})
 	http.HandleFunc("/jobs/", s.GetJobHandler)
+	// Prometheus metrics endpoint
+	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/workers", s.ListWorkersHandler)
 
 	log.Println("Starting server on :8080")
