@@ -3,6 +3,7 @@ package main
 import (
 	"distributed-job-queue/pkg/api"
 	"distributed-job-queue/pkg/logging"
+	"distributed-job-queue/pkg/persistence"
 	"distributed-job-queue/pkg/storage"
 	"log"
 	"net/http"
@@ -15,6 +16,16 @@ import (
 func main() {
 	_ = logging.Init(true)
 	q := storage.NewRedisQueue("localhost:6379", "jobs")
+
+	// Optional Postgres persistence for lifecycle events
+	if dsn := os.Getenv("POSTGRES_DSN"); dsn != "" {
+		if ph, err := persistence.NewPostgresHooks(dsn); err == nil {
+			q.WithHooks(ph)
+			log.Println("Postgres persistence enabled for job events")
+		} else {
+			log.Printf("Postgres hooks init failed: %v\n", err)
+		}
+	}
 
 	s := &api.Server{Q: q}
 

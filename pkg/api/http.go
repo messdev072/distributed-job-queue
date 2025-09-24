@@ -18,8 +18,9 @@ type Server struct {
 
 func (s *Server) EnqueueHandler(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Queue   string `json:"queue"`
-		Payload string `json:"payload"`
+		Queue    string `json:"queue"`
+		Payload  string `json:"payload"`
+		Priority int    `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		logging.L().Error("enqueue decode error", zap.Error(err), zap.String("job_id", ""), zap.String("queue", body.Queue), zap.String("worker_id", ""))
@@ -28,6 +29,7 @@ func (s *Server) EnqueueHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := queue.NewJob(body.Payload, body.Queue)
+	job.Priority = body.Priority
 	if err := s.Q.Enqueue(job); err != nil {
 		logging.L().Error("enqueue failed", zap.Error(err), zap.String("job_id", job.ID), zap.String("queue", body.Queue), zap.String("worker_id", ""))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -81,8 +83,8 @@ func (s *Server) ListQueuesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, q := range queues {
-		key := fmt.Sprintf("jobs:%s", q)
-		if n, err := s.Q.Client().LLen(s.Q.Ctx(), key).Result(); err == nil {
+		key := fmt.Sprintf("jobs:%s:z", q)
+		if n, err := s.Q.Client().ZCard(s.Q.Ctx(), key).Result(); err == nil {
 			resp[q] = n
 		}
 	}

@@ -160,6 +160,33 @@ func TestMultipleQueuesProcessIndependently(t *testing.T) {
 	assert.Equal(t, queue.StatusCompleted, upd2.Status)
 }
 
+func TestPriorityOrderingFIFOWithinPriority(t *testing.T) {
+	q, name := newTestQueueWithName()
+	// Enqueue low priority first
+	j1 := queue.NewJob("low-1", name)
+	j1.Priority = 1
+	_ = q.Enqueue(j1)
+	// Then higher priority
+	j2 := queue.NewJob("high", name)
+	j2.Priority = 10
+	_ = q.Enqueue(j2)
+	// Then another low with later time
+	time.Sleep(2 * time.Millisecond)
+	j3 := queue.NewJob("low-2", name)
+	j3.Priority = 1
+	_ = q.Enqueue(j3)
+
+	d1, _ := q.Dequeue(name)
+	assert.Equal(t, j2.ID, d1.ID, "higher priority should dequeue first")
+	_ = q.Ack(d1)
+	d2, _ := q.Dequeue(name)
+	assert.Equal(t, j1.ID, d2.ID, "older within same priority first")
+	_ = q.Ack(d2)
+	d3, _ := q.Dequeue(name)
+	assert.Equal(t, j3.ID, d3.ID)
+	_ = q.Ack(d3)
+}
+
 func TestRecoverySweepDeadWorker(t *testing.T) {
 	q, name := newTestQueueWithName()
 

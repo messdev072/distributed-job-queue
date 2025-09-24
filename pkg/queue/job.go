@@ -21,6 +21,7 @@ type Job struct {
 	Status     Status    `json:"status"`
 	Payload    string    `json:"payload"`
 	QueueName  string    `json:"queue"`
+	Priority   int       `json:"priority"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 	RetryCount int       `json:"retry_count"`
@@ -34,6 +35,7 @@ func NewJob(payload string, queueName string) *Job {
 		Status:     StatusPending,
 		Payload:    payload,
 		QueueName:  queueName,
+		Priority:   0,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		MaxRetries: 3,

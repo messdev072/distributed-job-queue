@@ -49,8 +49,9 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 		return err
 	}
 
-	// push to list
-	if err := r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err(); err != nil {
+	// push to ZSET with priority-aware score
+	score := r.scoreFor(job.Priority, job.CreatedAt)
+	if err := r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", job.QueueName), redis.Z{Score: score, Member: job.ID}).Err(); err != nil {
 		return err
 	}
 	// track queue names in a Redis set for fast discovery
@@ -61,8 +62,8 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 		"queue":     job.QueueName,
 		"timestamp": time.Now().Unix(),
 	})
-	// update queue length metric
-	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
+	// update queue length metric (size of ZSET)
+	if n, err := r.client.ZCard(r.ctx, fmt.Sprintf("jobs:%s:z", job.QueueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
 	}
 	// fire hook asynchronously to avoid blocking enqueue path
@@ -74,10 +75,16 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 }
 
 func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
-	jobID, err := r.client.RPop(r.ctx, fmt.Sprintf("jobs:%s", queueName)).Result()
-	if err != nil {
+	// Atomically pop the min score member (highest priority + oldest)
+	zres, err := r.client.ZPopMin(r.ctx, fmt.Sprintf("jobs:%s:z", queueName), 1).Result()
+	if err != nil || len(zres) == 0 {
+		if err == nil {
+			// Empty
+			return nil, redis.Nil
+		}
 		return nil, err
 	}
+	jobID := zres[0].Member.(string)
 
 	jobData, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", jobID), "data").Result()
 	if err != nil {
@@ -146,7 +153,7 @@ func (r *RedisQueue) Ack(job *queue.Job) error {
 	m.JobsProcessedTotal.WithLabelValues("success", job.QueueName).Inc()
 	m.ObserveJobCompletion(job.QueueName, job.CreatedAt)
 	// update queue length metric
-	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
+	if n, err := r.client.ZCard(r.ctx, fmt.Sprintf("jobs:%s:z", job.QueueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
 	}
 	// trigger hook (async, safe)
@@ -194,7 +201,7 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 	if err := r.UpdateJob(job); err != nil {
 		return err
 	}
-	if err := r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName), job.ID).Err(); err != nil {
+	if err := r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", job.QueueName), redis.Z{Score: r.scoreFor(job.Priority, time.Now()), Member: job.ID}).Err(); err != nil {
 		return err
 	}
 	// job has re-entered the queue; treat as enqueue for hooks
@@ -207,7 +214,7 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 		"queue":     job.QueueName,
 		"timestamp": time.Now().Unix(),
 	})
-	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", job.QueueName)).Result(); err == nil {
+	if n, err := r.client.ZCard(r.ctx, fmt.Sprintf("jobs:%s:z", job.QueueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(job.QueueName).Set(float64(n))
 	}
 	// still a failure occurrence (for this attempt) trigger hook
@@ -221,7 +228,7 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 func (r *RedisQueue) RequeueExpired(queueName string) error {
 	now := time.Now().Unix()
 	procKey := fmt.Sprintf("jobs:%s:processing", queueName)
-	queueKey := fmt.Sprintf("jobs:%s", queueName)
+	queueZ := fmt.Sprintf("jobs:%s:z", queueName)
 
 	// First, recover jobs owned by dead workers regardless of score
 	// Fetch all ownerships to find jobs for which the worker heartbeat is missing.
@@ -238,7 +245,7 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 			// dead worker: move job back to queue and clear from processing and ownership
 			_ = r.client.ZRem(r.ctx, procKey, jobID).Err()
 			_ = r.client.HDel(r.ctx, "job:ownership", jobID).Err()
-			_ = r.client.LPush(r.ctx, queueKey, jobID).Err()
+			_ = r.client.ZAdd(r.ctx, queueZ, redis.Z{Score: r.scoreFor(0, time.Now()), Member: jobID}).Err()
 			// Update job status in hash
 			r.client.HSet(r.ctx, fmt.Sprintf("job:%s", jobID),
 				"status", queue.StatusPending,
@@ -262,7 +269,7 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 
 	for _, jobID := range expired {
 		_ = r.client.ZRem(r.ctx, procKey, jobID).Err()
-		_ = r.client.LPush(r.ctx, queueKey, jobID).Err()
+		_ = r.client.ZAdd(r.ctx, queueZ, redis.Z{Score: r.scoreFor(0, time.Now()), Member: jobID}).Err()
 		// Update job status in hash
 		r.client.HSet(r.ctx, fmt.Sprintf("job:%s", jobID),
 			"status", queue.StatusPending,
@@ -285,11 +292,11 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 	}
 	for _, jobID := range readyDelayed {
 		_ = r.client.ZRem(r.ctx, fmt.Sprintf("jobs:%s:delayed", queueName), jobID).Err()
-		_ = r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s", queueName), jobID).Err()
+		_ = r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", queueName), redis.Z{Score: r.scoreFor(0, time.Now()), Member: jobID}).Err()
 	}
 
 	// refresh queue length metric
-	if n, err := r.client.LLen(r.ctx, fmt.Sprintf("jobs:%s", queueName)).Result(); err == nil {
+	if n, err := r.client.ZCard(r.ctx, fmt.Sprintf("jobs:%s:z", queueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(queueName).Set(float64(n))
 	}
 
@@ -312,4 +319,12 @@ func (r *RedisQueue) appendEvent(jobID string, evt map[string]interface{}) error
 	// keep last 100
 	_ = r.client.LTrim(r.ctx, key, 0, 99).Err()
 	return nil
+}
+
+// scoreFor encodes priority (higher first) and enqueue time (earlier first)
+// using the formula: score = -priority*1e12 + (enqueueUnixNano/1e6)
+func (r *RedisQueue) scoreFor(priority int, t time.Time) float64 {
+	base := -1 * float64(priority) * 1e12
+	ts := float64(t.UnixNano()) / 1e6
+	return base + ts
 }
