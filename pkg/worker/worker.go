@@ -49,8 +49,7 @@ func (w *Worker) Start() {
 			continue
 		}
 
-		// Record ownership: job is being processed by this worker
-		_ = w.Queue.Client().HSet(w.Queue.Ctx(), "job:ownership", job.ID, w.ID).Err()
+		// Ownership is now handled by the backend's Dequeue method
 
 		job.Status = queue.StatusRunning
 		job.UpdatedAt = time.Now()

@@ -18,12 +18,47 @@ import (
 
 func main() {
 	_ = logging.Init(true)
-	q := storage.NewRedisQueue("localhost:6379", "jobs")
+
+	// Create backend based on BACKEND environment variable
+	backendType := os.Getenv("BACKEND")
+	if backendType == "" {
+		backendType = "redis" // default to redis
+	}
+
+	var backend storage.Backend
+	switch strings.ToLower(backendType) {
+	case "memory":
+		log.Println("Using memory backend (for testing)")
+		backend = storage.NewMemoryBackend()
+	case "redis":
+		redisAddr := os.Getenv("REDIS_ADDR")
+		if redisAddr == "" {
+			redisAddr = "localhost:6379"
+		}
+		log.Printf("Using Redis backend at %s", redisAddr)
+		backend = storage.NewRedisBackend(redisAddr)
+	case "postgres":
+		postgresDSN := os.Getenv("POSTGRES_DSN")
+		if postgresDSN == "" {
+			log.Fatal("POSTGRES_DSN environment variable is required for postgres backend")
+		}
+		log.Printf("Using Postgres backend")
+		var err error
+		backend, err = storage.NewPostgresBackend(postgresDSN)
+		if err != nil {
+			log.Fatalf("Failed to create Postgres backend: %v", err)
+		}
+	default:
+		log.Fatalf("Unknown backend type: %s (supported: memory, redis, postgres)", backendType)
+	}
+
+	// Create queue wrapper
+	q := storage.NewQueueWithBackend(backend)
 
 	// Optional Postgres persistence for lifecycle events
 	if dsn := os.Getenv("POSTGRES_DSN"); dsn != "" {
 		if ph, err := persistence.NewPostgresHooks(dsn); err == nil {
-			q.WithHooks(ph)
+			backend.SetHooks(ph)
 			log.Println("Postgres persistence enabled for job events")
 		} else {
 			log.Printf("Postgres hooks init failed: %v\n", err)
@@ -35,18 +70,23 @@ func main() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			// List queues and promote
-			queues, err := q.Client().SMembers(q.Ctx(), "queues").Result()
+			// List queues and promote delayed jobs
+			queues, err := backend.ListQueues()
 			if err != nil {
 				continue
 			}
 			for _, name := range queues {
-				_ = q.PromoteDelayed(name)
+				_ = backend.PromoteDelayed(name)
 			}
 		}
 	}()
 
-	schedStore := scheduler.NewStore(q.Client(), q.Ctx())
+	// Scheduler is only available with Redis backend for now
+	var schedStore *scheduler.Store
+	if redisBackend, ok := backend.(*storage.RedisBackend); ok {
+		schedStore = scheduler.NewStore(redisBackend.Client(), redisBackend.Ctx())
+	}
+
 	s := &api.Server{Q: q, Schedules: schedStore}
 
 	http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
@@ -94,26 +134,29 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/workers", s.ListWorkersHandler)
 
-	// Cron evaluation loop
-	go func() {
-		cronTicker := time.NewTicker(1 * time.Second)
-		defer cronTicker.Stop()
-		for range cronTicker.C {
-			due, err := schedStore.Due(time.Now(), 0)
-			if err != nil {
-				continue
-			}
-			for _, sc := range due {
-				job := queue.NewJob(sc.Payload, sc.Queue)
-				job.Priority = sc.Priority
-				job.RecurrenceID = sc.ID
-				if err := q.Enqueue(job); err != nil {
+	// Cron evaluation loop (only for Redis backend)
+	if schedStore != nil {
+		go func() {
+			cronTicker := time.NewTicker(1 * time.Second)
+			defer cronTicker.Stop()
+			for range cronTicker.C {
+				due, err := schedStore.Due(time.Now(), 0)
+				if err != nil {
 					continue
 				}
-				_ = schedStore.MarkRun(sc)
+				for _, sc := range due {
+					job := queue.NewJob(sc.Payload, sc.Queue)
+					job.Priority = sc.Priority
+					job.RecurrenceID = sc.ID
+					if err := q.Enqueue(job); err != nil {
+						continue
+					}
+					_ = schedStore.MarkRun(sc)
+				}
 			}
-		}
-	}()
+		}()
+		log.Println("Cron scheduler enabled")
+	}
 
 	log.Println("Starting server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))

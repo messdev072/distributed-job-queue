@@ -11,35 +11,33 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type RedisQueue struct {
+// RedisBackend implements Backend interface using Redis as storage.
+type RedisBackend struct {
 	client *redis.Client
 	ctx    context.Context
 	hooks  queue.LifecycleHooks
 }
 
-func NewRedisQueue(addr, queueName string) *RedisQueue {
+func NewRedisBackend(addr string) *RedisBackend {
 	rdb := redis.NewClient(&redis.Options{
 		Addr: addr,
 	})
-	rq := &RedisQueue{
+	return &RedisBackend{
 		client: rdb,
 		ctx:    context.Background(),
 		hooks:  queue.NoopHooks{},
 	}
-	return rq
 }
 
-// WithHooks sets lifecycle hooks for this queue instance.
-func (r *RedisQueue) WithHooks(h queue.LifecycleHooks) *RedisQueue {
-	if h == nil {
+func (r *RedisBackend) SetHooks(hooks queue.LifecycleHooks) {
+	if hooks == nil {
 		r.hooks = queue.NoopHooks{}
-		return r
+		return
 	}
-	r.hooks = h
-	return r
+	r.hooks = hooks
 }
 
-func (r *RedisQueue) Enqueue(job *queue.Job) error {
+func (r *RedisBackend) Enqueue(job *queue.Job) error {
 	// store metadata
 	data, err := json.Marshal(job)
 	if err != nil {
@@ -81,10 +79,7 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 	return nil
 }
 
-// EnqueueWithOpts adds dedupe/idempotency behavior.
-// dedupeKey: if provided and set already, returns existing job without creating a new one.
-// idempotencyKey reserved for future use (e.g., caching results) currently stored as a field.
-func (r *RedisQueue) EnqueueWithOpts(job *queue.Job, dedupeKey, idempotencyKey string) error {
+func (r *RedisBackend) EnqueueWithOpts(job *queue.Job, dedupeKey, idempotencyKey string) error {
 	if dedupeKey != "" {
 		dk := fmt.Sprintf("dedupe:%s", dedupeKey)
 		// Try SETNX to reserve key
@@ -105,7 +100,9 @@ func (r *RedisQueue) EnqueueWithOpts(job *queue.Job, dedupeKey, idempotencyKey s
 			// Fallback: proceed creating new if stale
 		}
 	}
-	if dedupeKey != "" { m.DedupeEvents.WithLabelValues("new").Inc() }
+	if dedupeKey != "" {
+		m.DedupeEvents.WithLabelValues("new").Inc()
+	}
 	if idempotencyKey != "" {
 		// Store idempotency key reference on job hash for later lookup
 		_ = r.client.HSet(r.ctx, fmt.Sprintf("job:%s", job.ID), "idempotency_key", idempotencyKey).Err()
@@ -113,7 +110,7 @@ func (r *RedisQueue) EnqueueWithOpts(job *queue.Job, dedupeKey, idempotencyKey s
 	return r.Enqueue(job)
 }
 
-func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
+func (r *RedisBackend) Dequeue(queueName string, workerID string, visibility time.Duration) (*queue.Job, error) {
 	// Atomically pop the min score member (highest priority + oldest)
 	zres, err := r.client.ZPopMin(r.ctx, fmt.Sprintf("jobs:%s:z", queueName), 1).Result()
 	if err != nil || len(zres) == 0 {
@@ -135,11 +132,12 @@ func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
 		return nil, err
 	}
 
-	// Mark as processing with a short visibility timeout so tests can expire it
-	deadline := time.Now().Add(1 * time.Second).Unix()
+	// Mark as processing with visibility timeout
+	deadline := time.Now().Add(visibility).Unix()
 	// ZSET for visibility timeout
 	_ = r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:processing", queueName), redis.Z{Score: float64(deadline), Member: job.ID}).Err()
-	// Note: ownership is assigned by the worker after Dequeue via job:ownership hash
+	// Set ownership
+	_ = r.client.HSet(r.ctx, "job:ownership", job.ID, workerID).Err()
 	// event: dequeued
 	_ = r.appendEvent(job.ID, map[string]interface{}{
 		"type":      "dequeued",
@@ -153,7 +151,7 @@ func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
 	return &job, nil
 }
 
-func (r *RedisQueue) GetJob(id string) (*queue.Job, error) {
+func (r *RedisBackend) GetJob(id string) (*queue.Job, error) {
 	jobData, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", id), "data").Result()
 	if err != nil {
 		return nil, err
@@ -167,7 +165,7 @@ func (r *RedisQueue) GetJob(id string) (*queue.Job, error) {
 	return &job, nil
 }
 
-func (r *RedisQueue) UpdateJob(job *queue.Job) error {
+func (r *RedisBackend) UpdateJob(job *queue.Job) error {
 	data, err := json.Marshal(job)
 	if err != nil {
 		return err
@@ -175,7 +173,7 @@ func (r *RedisQueue) UpdateJob(job *queue.Job) error {
 	return r.client.HSet(r.ctx, fmt.Sprintf("job:%s", job.ID), "data", data).Err()
 }
 
-func (r *RedisQueue) Ack(job *queue.Job) error {
+func (r *RedisBackend) Ack(job *queue.Job) error {
 	// Remove from processing set
 	_ = r.client.ZRem(r.ctx, fmt.Sprintf("jobs:%s:processing", job.QueueName), job.ID).Err()
 	// Clear ownership
@@ -207,7 +205,7 @@ func (r *RedisQueue) Ack(job *queue.Job) error {
 	return r.UpdateJob(job)
 }
 
-func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
+func (r *RedisBackend) Fail(job *queue.Job, reason string) error {
 	job.RetryCount++
 	job.UpdatedAt = time.Now()
 
@@ -219,8 +217,9 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 	// Always mark as failed for this attempt
 	job.Status = queue.StatusFailed
 
-	// If retries exhausted, send to DLQ; otherwise immediately requeue for retry
-	if job.RetryCount > job.MaxRetries {
+	// For at_most_once delivery, never retry - send to DLQ immediately
+	// Otherwise, check if retries exhausted
+	if job.Delivery == "at_most_once" || job.RetryCount > job.MaxRetries {
 		_ = r.client.LPush(r.ctx, fmt.Sprintf("jobs:%s:dlq", job.QueueName), job.ID).Err()
 		// Also push to global DLQ key expected by tests
 		_ = r.client.LPush(r.ctx, "jobs:dlq", job.ID).Err()
@@ -271,7 +270,7 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 	return nil
 }
 
-func (r *RedisQueue) RequeueExpired(queueName string) error {
+func (r *RedisBackend) RequeueExpired(queueName string) error {
 	now := time.Now().Unix()
 	procKey := fmt.Sprintf("jobs:%s:processing", queueName)
 	queueZ := fmt.Sprintf("jobs:%s:z", queueName)
@@ -288,15 +287,38 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 		// Check if worker:<id> exists
 		exists, _ := r.client.Exists(r.ctx, fmt.Sprintf("worker:%s", workerID)).Result()
 		if exists == 0 {
-			// dead worker: move job back to queue and clear from processing and ownership
+			// dead worker: check if job should be requeued based on delivery mode
+			jobDataStr, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", jobID), "data").Result()
+			if err != nil {
+				continue
+			}
+
+			var job queue.Job
+			if err := json.Unmarshal([]byte(jobDataStr), &job); err != nil {
+				continue
+			}
+
+			// For at_most_once delivery mode, if job is already failed, don't requeue
+			if job.Delivery == "at_most_once" && job.Status == queue.StatusFailed {
+				// Just remove from processing and ownership, don't requeue
+				_ = r.client.ZRem(r.ctx, procKey, jobID).Err()
+				_ = r.client.HDel(r.ctx, "job:ownership", jobID).Err()
+				_ = r.appendEvent(jobID, map[string]interface{}{
+					"type":      "dead_worker_at_most_once_not_requeued",
+					"queue":     queueName,
+					"timestamp": time.Now().Unix(),
+				})
+				continue
+			}
+
+			// Normal requeue for dead worker
 			_ = r.client.ZRem(r.ctx, procKey, jobID).Err()
 			_ = r.client.HDel(r.ctx, "job:ownership", jobID).Err()
 			_ = r.client.ZAdd(r.ctx, queueZ, redis.Z{Score: r.scoreFor(0, time.Now()), Member: jobID}).Err()
-			// Update job status in hash
-			r.client.HSet(r.ctx, fmt.Sprintf("job:%s", jobID),
-				"status", queue.StatusPending,
-				"updated_at", time.Now().Unix(),
-			)
+			// Update job status to pending
+			job.Status = queue.StatusPending
+			job.UpdatedAt = time.Now()
+			_ = r.UpdateJob(&job)
 			_ = r.appendEvent(jobID, map[string]interface{}{
 				"type":      "requeued_dead_worker",
 				"queue":     queueName,
@@ -314,13 +336,35 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 	}
 
 	for _, jobID := range expired {
+		// First check the job details to see if it should be requeued
+		jobDataStr, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", jobID), "data").Result()
+		if err != nil {
+			continue
+		}
+
+		var job queue.Job
+		if err := json.Unmarshal([]byte(jobDataStr), &job); err != nil {
+			continue
+		}
+
+		// For at_most_once delivery mode, if job is already failed, don't requeue
+		if job.Delivery == "at_most_once" && job.Status == queue.StatusFailed {
+			// Just remove from processing, don't requeue
+			_ = r.client.ZRem(r.ctx, procKey, jobID).Err()
+			_ = r.appendEvent(jobID, map[string]interface{}{
+				"type":      "expired_at_most_once_not_requeued",
+				"queue":     queueName,
+				"timestamp": time.Now().Unix(),
+			})
+			continue
+		}
+
 		_ = r.client.ZRem(r.ctx, procKey, jobID).Err()
 		_ = r.client.ZAdd(r.ctx, queueZ, redis.Z{Score: r.scoreFor(0, time.Now()), Member: jobID}).Err()
-		// Update job status in hash
-		r.client.HSet(r.ctx, fmt.Sprintf("job:%s", jobID),
-			"status", queue.StatusPending,
-			"updated_at", time.Now().Unix(),
-		)
+		// Update job status to pending
+		job.Status = queue.StatusPending
+		job.UpdatedAt = time.Now()
+		_ = r.UpdateJob(&job)
 		_ = r.appendEvent(jobID, map[string]interface{}{
 			"type":      "requeued_expired",
 			"queue":     queueName,
@@ -341,7 +385,7 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 }
 
 // PromoteDelayed moves due delayed jobs into the active priority ZSET
-func (r *RedisQueue) PromoteDelayed(queueName string) error {
+func (r *RedisBackend) PromoteDelayed(queueName string) error {
 	now := time.Now().Unix()
 	delayedKey := fmt.Sprintf("jobs:%s:delayed", queueName)
 	ready, err := r.client.ZRangeByScore(r.ctx, delayedKey, &redis.ZRangeBy{Min: "-inf", Max: fmt.Sprintf("%d", now)}).Result()
@@ -378,11 +422,19 @@ func (r *RedisQueue) PromoteDelayed(queueName string) error {
 	return nil
 }
 
-func (rq *RedisQueue) Client() *redis.Client { return rq.client }
-func (rq *RedisQueue) Ctx() context.Context  { return rq.ctx }
+func (r *RedisBackend) ListQueues() ([]string, error) {
+	return r.client.SMembers(r.ctx, "queues").Result()
+}
+
+func (r *RedisBackend) GetQueueLength(queueName string) (int64, error) {
+	return r.client.ZCard(r.ctx, fmt.Sprintf("jobs:%s:z", queueName)).Result()
+}
+
+func (r *RedisBackend) Client() *redis.Client { return r.client }
+func (r *RedisBackend) Ctx() context.Context  { return r.ctx }
 
 // appendEvent stores a JSON event in a capped list per job
-func (r *RedisQueue) appendEvent(jobID string, evt map[string]interface{}) error {
+func (r *RedisBackend) appendEvent(jobID string, evt map[string]interface{}) error {
 	b, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -398,8 +450,78 @@ func (r *RedisQueue) appendEvent(jobID string, evt map[string]interface{}) error
 
 // scoreFor encodes priority (higher first) and enqueue time (earlier first)
 // using the formula: score = -priority*1e12 + (enqueueUnixNano/1e6)
-func (r *RedisQueue) scoreFor(priority int, t time.Time) float64 {
+func (r *RedisBackend) scoreFor(priority int, t time.Time) float64 {
 	base := -1 * float64(priority) * 1e12
 	ts := float64(t.UnixNano()) / 1e6
 	return base + ts
+}
+
+// Legacy RedisQueue wraps RedisBackend for backward compatibility.
+type RedisQueue struct {
+	backend Backend
+}
+
+func NewRedisQueue(addr, queueName string) *RedisQueue {
+	backend := NewRedisBackend(addr)
+	return &RedisQueue{
+		backend: backend,
+	}
+}
+
+// NewQueueWithBackend creates a RedisQueue using any Backend implementation.
+func NewQueueWithBackend(backend Backend) *RedisQueue {
+	return &RedisQueue{
+		backend: backend,
+	}
+}
+
+// WithHooks sets lifecycle hooks for this queue instance.
+func (r *RedisQueue) WithHooks(h queue.LifecycleHooks) *RedisQueue {
+	r.backend.SetHooks(h)
+	return r
+}
+
+func (r *RedisQueue) Enqueue(job *queue.Job) error {
+	return r.backend.Enqueue(job)
+}
+
+func (r *RedisQueue) EnqueueWithOpts(job *queue.Job, dedupeKey, idempotencyKey string) error {
+	return r.backend.EnqueueWithOpts(job, dedupeKey, idempotencyKey)
+}
+
+func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
+	// Use default visibility timeout of 1 second for legacy compatibility
+	return r.backend.Dequeue(queueName, "", 1*time.Second)
+}
+
+func (r *RedisQueue) GetJob(id string) (*queue.Job, error) {
+	return r.backend.GetJob(id)
+}
+
+func (r *RedisQueue) UpdateJob(job *queue.Job) error {
+	return r.backend.UpdateJob(job)
+}
+
+func (r *RedisQueue) Ack(job *queue.Job) error {
+	return r.backend.Ack(job)
+}
+
+func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
+	return r.backend.Fail(job, reason)
+}
+
+func (r *RedisQueue) RequeueExpired(queueName string) error {
+	return r.backend.RequeueExpired(queueName)
+}
+
+func (r *RedisQueue) PromoteDelayed(queueName string) error {
+	return r.backend.PromoteDelayed(queueName)
+}
+
+func (r *RedisQueue) Client() *redis.Client {
+	return r.backend.Client()
+}
+
+func (r *RedisQueue) Ctx() context.Context {
+	return r.backend.Ctx()
 }
