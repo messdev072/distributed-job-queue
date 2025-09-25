@@ -39,6 +39,14 @@ var (
 		},
 		[]string{"queue"},
 	)
+
+	DedupeEvents = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jobs_dedupe_total",
+			Help: "Dedupe events (outcome=new|hit)",
+		},
+		[]string{"outcome"},
+	)
 )
 
 // ObserveJobCompletion records job latency from created_at to now

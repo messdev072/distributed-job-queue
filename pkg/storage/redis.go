@@ -81,6 +81,38 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 	return nil
 }
 
+// EnqueueWithOpts adds dedupe/idempotency behavior.
+// dedupeKey: if provided and set already, returns existing job without creating a new one.
+// idempotencyKey reserved for future use (e.g., caching results) currently stored as a field.
+func (r *RedisQueue) EnqueueWithOpts(job *queue.Job, dedupeKey, idempotencyKey string) error {
+	if dedupeKey != "" {
+		dk := fmt.Sprintf("dedupe:%s", dedupeKey)
+		// Try SETNX to reserve key
+		set, err := r.client.SetNX(r.ctx, dk, job.ID, 10*time.Minute).Result()
+		if err != nil {
+			return err
+		}
+		if !set {
+			// Existing job ID
+			existingID, _ := r.client.Get(r.ctx, dk).Result()
+			exJob, err := r.GetJob(existingID)
+			if err == nil && exJob != nil {
+				// copy existing into passed job pointer for API response consistency
+				*job = *exJob
+				m.DedupeEvents.WithLabelValues("hit").Inc()
+				return nil
+			}
+			// Fallback: proceed creating new if stale
+		}
+	}
+	if dedupeKey != "" { m.DedupeEvents.WithLabelValues("new").Inc() }
+	if idempotencyKey != "" {
+		// Store idempotency key reference on job hash for later lookup
+		_ = r.client.HSet(r.ctx, fmt.Sprintf("job:%s", job.ID), "idempotency_key", idempotencyKey).Err()
+	}
+	return r.Enqueue(job)
+}
+
 func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
 	// Atomically pop the min score member (highest priority + oldest)
 	zres, err := r.client.ZPopMin(r.ctx, fmt.Sprintf("jobs:%s:z", queueName), 1).Result()
@@ -168,6 +200,10 @@ func (r *RedisQueue) Ack(job *queue.Job) error {
 		defer func() { _ = recover() }()
 		r.hooks.OnAck(r.ctx, j)
 	}(job)
+	// Persist idempotency result if key present
+	if key, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", job.ID), "idempotency_key").Result(); err == nil && key != "" {
+		_ = r.client.Set(r.ctx, fmt.Sprintf("idempotency:%s:result", key), "COMPLETED", 24*time.Hour).Err()
+	}
 	return r.UpdateJob(job)
 }
 
@@ -201,6 +237,9 @@ func (r *RedisQueue) Fail(job *queue.Job, reason string) error {
 			defer func() { _ = recover() }()
 			r.hooks.OnFail(r.ctx, j, rsn)
 		}(job, reason)
+		if key, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", job.ID), "idempotency_key").Result(); err == nil && key != "" {
+			_ = r.client.Set(r.ctx, fmt.Sprintf("idempotency:%s:result", key), "FAILED", 24*time.Hour).Err()
+		}
 		return r.UpdateJob(job)
 	}
 
@@ -289,7 +328,9 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 		})
 	}
 
-	if err := r.PromoteDelayed(queueName); err != nil { return err }
+	if err := r.PromoteDelayed(queueName); err != nil {
+		return err
+	}
 
 	// refresh queue length metric
 	if n, err := r.client.ZCard(r.ctx, fmt.Sprintf("jobs:%s:z", queueName)).Result(); err == nil {
@@ -304,25 +345,33 @@ func (r *RedisQueue) PromoteDelayed(queueName string) error {
 	now := time.Now().Unix()
 	delayedKey := fmt.Sprintf("jobs:%s:delayed", queueName)
 	ready, err := r.client.ZRangeByScore(r.ctx, delayedKey, &redis.ZRangeBy{Min: "-inf", Max: fmt.Sprintf("%d", now)}).Result()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	for _, jobID := range ready {
 		// Remove from delayed
 		_ = r.client.ZRem(r.ctx, delayedKey, jobID).Err()
 		// Fetch job to get its priority & created time for stable ordering
 		jd, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", jobID), "data").Result()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		var job queue.Job
-		if err := json.Unmarshal([]byte(jd), &job); err != nil { continue }
+		if err := json.Unmarshal([]byte(jd), &job); err != nil {
+			continue
+		}
 		// If job.AvailableAt set, treat CreatedAt as now for ordering to avoid inversion
 		enqueueTime := time.Now()
 		_ = r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", queueName), redis.Z{Score: r.scoreFor(job.Priority, enqueueTime), Member: jobID}).Err()
 		// update job timestamps
 		job.UpdatedAt = enqueueTime
-		if job.AvailableAt.After(enqueueTime) { job.AvailableAt = enqueueTime }
+		if job.AvailableAt.After(enqueueTime) {
+			job.AvailableAt = enqueueTime
+		}
 		_ = r.UpdateJob(&job)
 		_ = r.appendEvent(jobID, map[string]interface{}{
-			"type": "promoted_delayed",
-			"queue": queueName,
+			"type":      "promoted_delayed",
+			"queue":     queueName,
 			"timestamp": time.Now().Unix(),
 		})
 	}

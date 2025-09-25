@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/gorhill/cronexpr v0.0.0-20180427100037-88b0669f7d75
 	github.com/jackc/pgx/v5 v5.7.4
 	github.com/prometheus/client_golang v1.19.1
 	github.com/redis/go-redis/v9 v9.14.0

@@ -17,17 +17,18 @@ const (
 )
 
 type Job struct {
-	ID         string    `json:"id"`
-	Status     Status    `json:"status"`
-	Payload    string    `json:"payload"`
-	QueueName  string    `json:"queue"`
-	Priority   int       `json:"priority"`
-	AvailableAt time.Time `json:"available_at,omitempty"`
-	RecurrenceID string   `json:"recurrence_id,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	RetryCount int       `json:"retry_count"`
-	MaxRetries int       `json:"max_retries"`
+	ID           string    `json:"id"`
+	Status       Status    `json:"status"`
+	Payload      string    `json:"payload"`
+	QueueName    string    `json:"queue"`
+	Priority     int       `json:"priority"`
+	AvailableAt  time.Time `json:"available_at,omitempty"`
+	RecurrenceID string    `json:"recurrence_id,omitempty"`
+	Delivery     string    `json:"delivery,omitempty"` // at_least_once (default) or at_most_once
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	RetryCount   int       `json:"retry_count"`
+	MaxRetries   int       `json:"max_retries"`
 }
 
 func NewJob(payload string, queueName string) *Job {
@@ -42,5 +43,6 @@ func NewJob(payload string, queueName string) *Job {
 		UpdatedAt:  now,
 		MaxRetries: 3,
 		RetryCount: 0,
+		Delivery:   "at_least_once",
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"distributed-job-queue/pkg/api"
 	"distributed-job-queue/pkg/logging"
 	"distributed-job-queue/pkg/persistence"
+	"distributed-job-queue/pkg/queue"
+	"distributed-job-queue/pkg/scheduler"
 	"distributed-job-queue/pkg/storage"
 	"log"
 	"net/http"
@@ -29,20 +31,23 @@ func main() {
 	}
 
 	// Delayed job promotion ticker
-	go func(){
+	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			// List queues and promote
 			queues, err := q.Client().SMembers(q.Ctx(), "queues").Result()
-			if err != nil { continue }
+			if err != nil {
+				continue
+			}
 			for _, name := range queues {
 				_ = q.PromoteDelayed(name)
 			}
 		}
 	}()
 
-	s := &api.Server{Q: q}
+	schedStore := scheduler.NewStore(q.Client(), q.Ctx())
+	s := &api.Server{Q: q, Schedules: schedStore}
 
 	http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -82,9 +87,33 @@ func main() {
 		// default to job detail if not matched by above
 		s.GetJobDetailHandler(w, r)
 	}))
+	// Schedule CRUD
+	http.HandleFunc("/admin/schedules", admin(s.SchedulesHandler))
+	http.HandleFunc("/admin/schedules/", admin(s.SchedulesHandler))
 	// Prometheus metrics endpoint
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/workers", s.ListWorkersHandler)
+
+	// Cron evaluation loop
+	go func() {
+		cronTicker := time.NewTicker(1 * time.Second)
+		defer cronTicker.Stop()
+		for range cronTicker.C {
+			due, err := schedStore.Due(time.Now(), 0)
+			if err != nil {
+				continue
+			}
+			for _, sc := range due {
+				job := queue.NewJob(sc.Payload, sc.Queue)
+				job.Priority = sc.Priority
+				job.RecurrenceID = sc.ID
+				if err := q.Enqueue(job); err != nil {
+					continue
+				}
+				_ = schedStore.MarkRun(sc)
+			}
+		}
+	}()
 
 	log.Println("Starting server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))

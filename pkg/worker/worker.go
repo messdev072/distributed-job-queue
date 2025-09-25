@@ -4,6 +4,7 @@ import (
 	"distributed-job-queue/pkg/logging"
 	m "distributed-job-queue/pkg/metrics"
 	"distributed-job-queue/pkg/queue"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -60,6 +61,11 @@ func (w *Worker) Start() {
 			zap.String("queue", w.QueueName),
 			zap.String("worker_id", w.ID),
 		)
+		if job.Delivery == "at_most_once" {
+			// For at-most-once, remove from processing visibility immediately to avoid retries
+			_ = w.Queue.Client().ZRem(w.Queue.Ctx(), fmt.Sprintf("jobs:%s:processing", w.QueueName), job.ID).Err()
+		}
+
 		if err := w.Handler(job); err != nil {
 			logging.L().Error("job failed",
 				zap.String("job_id", job.ID),
@@ -67,7 +73,14 @@ func (w *Worker) Start() {
 				zap.String("worker_id", w.ID),
 				zap.Error(err),
 			)
-			_ = w.Queue.Fail(job, err.Error())
+			if job.Delivery == "at_most_once" {
+				// Mark failed but do not retry
+				job.Status = queue.StatusFailed
+				job.UpdatedAt = time.Now()
+				_ = w.Queue.UpdateJob(job)
+			} else {
+				_ = w.Queue.Fail(job, err.Error())
+			}
 			m.JobsProcessedTotal.WithLabelValues("fail", w.QueueName).Inc()
 			m.ObserveJobCompletion(w.QueueName, job.CreatedAt)
 		} else {

@@ -3,6 +3,7 @@ package api
 import (
 	"distributed-job-queue/pkg/logging"
 	"distributed-job-queue/pkg/queue"
+	"distributed-job-queue/pkg/scheduler"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,15 +14,19 @@ import (
 )
 
 type Server struct {
-	Q queue.Queue
+	Q         queue.Queue
+	Schedules *scheduler.Store
 }
 
 func (s *Server) EnqueueHandler(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Queue    string `json:"queue"`
-		Payload  string `json:"payload"`
-		Priority int    `json:"priority"`
-		DelaySeconds int `json:"delay_seconds"`
+		Queue          string `json:"queue"`
+		Payload        string `json:"payload"`
+		Priority       int    `json:"priority"`
+		DelaySeconds   int    `json:"delay_seconds"`
+		Delivery       string `json:"delivery"`
+		DedupeKey      string `json:"dedupe_key"`
+		IdempotencyKey string `json:"idempotency_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		logging.L().Error("enqueue decode error", zap.Error(err), zap.String("job_id", ""), zap.String("queue", body.Queue), zap.String("worker_id", ""))
@@ -31,10 +36,14 @@ func (s *Server) EnqueueHandler(w http.ResponseWriter, r *http.Request) {
 
 	job := queue.NewJob(body.Payload, body.Queue)
 	job.Priority = body.Priority
+	if body.Delivery != "" {
+		job.Delivery = body.Delivery
+	}
+	// pass dedupe/idempotency via events or future headers (storage handles)
 	if body.DelaySeconds > 0 {
 		job.AvailableAt = time.Now().Add(time.Duration(body.DelaySeconds) * time.Second)
 	}
-	if err := s.Q.Enqueue(job); err != nil {
+	if err := s.Q.EnqueueWithOpts(job, body.DedupeKey, body.IdempotencyKey); err != nil {
 		logging.L().Error("enqueue failed", zap.Error(err), zap.String("job_id", job.ID), zap.String("queue", body.Queue), zap.String("worker_id", ""))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -125,7 +134,118 @@ func (s *Server) GetJobDetailHandler(w http.ResponseWriter, r *http.Request) {
 		"job":    job,
 		"events": parsed,
 	}
+	// include delivery and idempotency metadata if present
+	if job.Delivery != "" { resp["delivery"] = job.Delivery }
+	if key, err := s.Q.Client().HGet(s.Q.Ctx(), fmt.Sprintf("job:%s", job.ID), "idempotency_key").Result(); err == nil && key != "" {
+		resp["idempotency_key"] = key
+		if res, err2 := s.Q.Client().Get(s.Q.Ctx(), fmt.Sprintf("idempotency:%s:result", key)).Result(); err2 == nil {
+			resp["idempotency_result"] = res
+		}
+	}
 	json.NewEncoder(w).Encode(resp)
+}
+
+// Schedules CRUD (admin). Expect bearer auth handled upstream.
+// POST /admin/schedules -> create
+// GET /admin/schedules -> list
+// GET /admin/schedules/:id -> get
+// PUT /admin/schedules/:id -> update
+// DELETE /admin/schedules/:id -> delete
+func (s *Server) SchedulesHandler(w http.ResponseWriter, r *http.Request) {
+	if s.Schedules == nil {
+		http.Error(w, "scheduling disabled", http.StatusNotImplemented)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/admin/schedules")
+	path = strings.Trim(path, "/")
+	switch r.Method {
+	case http.MethodPost:
+		var body struct {
+			Queue, Payload, Cron string
+			Priority             int
+			Enabled              bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		sc := &scheduler.Schedule{Queue: body.Queue, Payload: body.Payload, Cron: body.Cron, Priority: body.Priority, Enabled: body.Enabled}
+		if err := s.Schedules.Create(sc); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sc)
+	case http.MethodGet:
+		if path == "" { // list
+			list, err := s.Schedules.List(0)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			json.NewEncoder(w).Encode(list)
+			return
+		}
+		id := path
+		sc, err := s.Schedules.Get(id)
+		if err != nil {
+			http.Error(w, err.Error(), 404)
+			return
+		}
+		json.NewEncoder(w).Encode(sc)
+	case http.MethodPut:
+		if path == "" {
+			http.Error(w, "missing id", 400)
+			return
+		}
+		id := path
+		sc, err := s.Schedules.Get(id)
+		if err != nil {
+			http.Error(w, err.Error(), 404)
+			return
+		}
+		var body struct {
+			Queue, Payload, Cron string
+			Priority             int
+			Enabled              *bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if body.Queue != "" {
+			sc.Queue = body.Queue
+		}
+		if body.Payload != "" {
+			sc.Payload = body.Payload
+		}
+		if body.Cron != "" {
+			sc.Cron = body.Cron
+		}
+		if body.Priority != 0 {
+			sc.Priority = body.Priority
+		}
+		if body.Enabled != nil {
+			sc.Enabled = *body.Enabled
+		}
+		if err := s.Schedules.Update(sc); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		json.NewEncoder(w).Encode(sc)
+	case http.MethodDelete:
+		if path == "" {
+			http.Error(w, "missing id", 400)
+			return
+		}
+		if err := s.Schedules.Delete(path); err != nil {
+			http.Error(w, err.Error(), 404)
+			return
+		}
+		w.WriteHeader(204)
+	default:
+		http.Error(w, "method", 405)
+	}
 }
 
 // POST /jobs/:id/retry -> manually requeue a failed job

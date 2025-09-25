@@ -212,6 +212,37 @@ func TestDelayedJobPromotion(t *testing.T) {
 	}
 }
 
+func TestDedupeEnqueueReturnsExisting(t *testing.T) {
+	q, name := newTestQueueWithName()
+	job1 := queue.NewJob("payload", name)
+	err := q.EnqueueWithOpts(job1, "client-123", "")
+	assert.NoError(t, err)
+	job2 := queue.NewJob("payload2", name)
+	err = q.EnqueueWithOpts(job2, "client-123", "")
+	assert.NoError(t, err)
+	// job2 should have been replaced with job1 data (same ID)
+	assert.Equal(t, job1.ID, job2.ID)
+}
+
+func TestAtMostOnceNoRetry(t *testing.T) {
+	q, name := newTestQueueWithName()
+	job := queue.NewJob("x", name)
+	job.Delivery = "at_most_once"
+	_ = q.Enqueue(job)
+	// dequeue and simulate worker failure
+	deq, err := q.Dequeue(name)
+	assert.NoError(t, err)
+	assert.Equal(t, "at_most_once", deq.Delivery)
+	// simulate handler failure by calling Fail logic: we can't call worker; manually mimic
+	// In at_most_once mode worker would mark as failed without requeue
+	deq.Status = queue.StatusFailed
+	_ = q.UpdateJob(deq)
+	// RequeueExpired should NOT bring it back
+	_ = q.RequeueExpired(name)
+	_, err = q.Dequeue(name)
+	assert.Error(t, err, "should not dequeue again")
+}
+
 func TestRecoverySweepDeadWorker(t *testing.T) {
 	q, name := newTestQueueWithName()
 
