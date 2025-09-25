@@ -14,8 +14,9 @@ import (
 
 // PostgresBackend implements Backend interface using PostgreSQL for job storage.
 type PostgresBackend struct {
-	pool  *pgxpool.Pool
-	hooks queue.LifecycleHooks
+	pool        *pgxpool.Pool
+	hooks       queue.LifecycleHooks
+	rateLimiter queue.RateLimiter
 }
 
 // NewPostgresBackend creates a new PostgreSQL backend.
@@ -26,8 +27,9 @@ func NewPostgresBackend(dsn string) (*PostgresBackend, error) {
 	}
 
 	backend := &PostgresBackend{
-		pool:  pool,
-		hooks: queue.NoopHooks{},
+		pool:        pool,
+		hooks:       queue.NoopHooks{},
+		rateLimiter: queue.NoopRateLimiter{},
 	}
 
 	if err := backend.initTables(); err != nil {
@@ -725,4 +727,18 @@ func (p *PostgresBackend) Close() error {
 		p.pool.Close()
 	}
 	return nil
+}
+
+// SetRateLimiter sets the rate limiter for this backend.
+func (p *PostgresBackend) SetRateLimiter(limiter queue.RateLimiter) {
+	if limiter == nil {
+		p.rateLimiter = queue.NoopRateLimiter{}
+		return
+	}
+	p.rateLimiter = limiter
+}
+
+// GetRateLimiter returns the current rate limiter.
+func (p *PostgresBackend) GetRateLimiter() queue.RateLimiter {
+	return p.rateLimiter
 }

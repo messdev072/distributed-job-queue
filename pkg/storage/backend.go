@@ -35,4 +35,8 @@ type Backend interface {
 
 	// Lifecycle hooks
 	SetHooks(hooks queue.LifecycleHooks)
+	
+	// Rate limiting
+	SetRateLimiter(limiter queue.RateLimiter)
+	GetRateLimiter() queue.RateLimiter
 }

@@ -13,9 +13,10 @@ import (
 
 // RedisBackend implements Backend interface using Redis as storage.
 type RedisBackend struct {
-	client *redis.Client
-	ctx    context.Context
-	hooks  queue.LifecycleHooks
+	client      *redis.Client
+	ctx         context.Context
+	hooks       queue.LifecycleHooks
+	rateLimiter queue.RateLimiter
 }
 
 func NewRedisBackend(addr string) *RedisBackend {
@@ -23,9 +24,10 @@ func NewRedisBackend(addr string) *RedisBackend {
 		Addr: addr,
 	})
 	return &RedisBackend{
-		client: rdb,
-		ctx:    context.Background(),
-		hooks:  queue.NoopHooks{},
+		client:      rdb,
+		ctx:         context.Background(),
+		hooks:       queue.NoopHooks{},
+		rateLimiter: queue.NoopRateLimiter{},
 	}
 }
 
@@ -496,6 +498,20 @@ func (r *RedisQueue) Dequeue(queueName string) (*queue.Job, error) {
 
 func (r *RedisQueue) GetJob(id string) (*queue.Job, error) {
 	return r.backend.GetJob(id)
+}
+
+// SetRateLimiter sets the rate limiter for this backend.
+func (r *RedisBackend) SetRateLimiter(limiter queue.RateLimiter) {
+	if limiter == nil {
+		r.rateLimiter = queue.NoopRateLimiter{}
+		return
+	}
+	r.rateLimiter = limiter
+}
+
+// GetRateLimiter returns the current rate limiter.
+func (r *RedisBackend) GetRateLimiter() queue.RateLimiter {
+	return r.rateLimiter
 }
 
 func (r *RedisQueue) UpdateJob(job *queue.Job) error {

@@ -21,6 +21,7 @@ type MemoryBackend struct {
 	dedupe      map[string]string // dedupe key -> job ID
 	idempotency map[string]string // idempotency key -> result
 	ownership   map[string]string // job ID -> worker ID
+	rateLimiter queue.RateLimiter
 }
 
 type memoryQueue struct {
@@ -48,6 +49,7 @@ func NewMemoryBackend() *MemoryBackend {
 		hooks:       queue.NoopHooks{},
 		events:      make(map[string][]map[string]interface{}),
 		dedupe:      make(map[string]string),
+		rateLimiter: queue.NoopRateLimiter{},
 		idempotency: make(map[string]string),
 		ownership:   make(map[string]string),
 	}
@@ -413,4 +415,24 @@ func (m *MemoryBackend) appendEvent(jobID string, evt map[string]interface{}) {
 	if len(m.events[jobID]) > 100 {
 		m.events[jobID] = m.events[jobID][len(m.events[jobID])-100:]
 	}
+}
+
+// SetRateLimiter sets the rate limiter for this backend.
+func (m *MemoryBackend) SetRateLimiter(limiter queue.RateLimiter) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	if limiter == nil {
+		m.rateLimiter = queue.NoopRateLimiter{}
+		return
+	}
+	m.rateLimiter = limiter
+}
+
+// GetRateLimiter returns the current rate limiter.
+func (m *MemoryBackend) GetRateLimiter() queue.RateLimiter {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	return m.rateLimiter
 }
