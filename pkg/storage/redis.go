@@ -49,10 +49,17 @@ func (r *RedisQueue) Enqueue(job *queue.Job) error {
 		return err
 	}
 
-	// push to ZSET with priority-aware score
-	score := r.scoreFor(job.Priority, job.CreatedAt)
-	if err := r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", job.QueueName), redis.Z{Score: score, Member: job.ID}).Err(); err != nil {
-		return err
+	if !job.AvailableAt.IsZero() && job.AvailableAt.After(time.Now()) {
+		// schedule into delayed ZSET; score = ready timestamp (unix seconds)
+		if err := r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:delayed", job.QueueName), redis.Z{Score: float64(job.AvailableAt.Unix()), Member: job.ID}).Err(); err != nil {
+			return err
+		}
+	} else {
+		// immediate enqueue to priority ZSET
+		score := r.scoreFor(job.Priority, job.CreatedAt)
+		if err := r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", job.QueueName), redis.Z{Score: score, Member: job.ID}).Err(); err != nil {
+			return err
+		}
 	}
 	// track queue names in a Redis set for fast discovery
 	_ = r.client.SAdd(r.ctx, "queues", job.QueueName).Err()
@@ -282,24 +289,43 @@ func (r *RedisQueue) RequeueExpired(queueName string) error {
 		})
 	}
 
-	// Also move ready delayed jobs back to the main queue if any
-	readyDelayed, err := r.client.ZRangeByScore(r.ctx, fmt.Sprintf("jobs:%s:delayed", queueName), &redis.ZRangeBy{
-		Min: "-inf",
-		Max: fmt.Sprintf("%d", now),
-	}).Result()
-	if err != nil {
-		return err
-	}
-	for _, jobID := range readyDelayed {
-		_ = r.client.ZRem(r.ctx, fmt.Sprintf("jobs:%s:delayed", queueName), jobID).Err()
-		_ = r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", queueName), redis.Z{Score: r.scoreFor(0, time.Now()), Member: jobID}).Err()
-	}
+	if err := r.PromoteDelayed(queueName); err != nil { return err }
 
 	// refresh queue length metric
 	if n, err := r.client.ZCard(r.ctx, fmt.Sprintf("jobs:%s:z", queueName)).Result(); err == nil {
 		m.QueueLength.WithLabelValues(queueName).Set(float64(n))
 	}
 
+	return nil
+}
+
+// PromoteDelayed moves due delayed jobs into the active priority ZSET
+func (r *RedisQueue) PromoteDelayed(queueName string) error {
+	now := time.Now().Unix()
+	delayedKey := fmt.Sprintf("jobs:%s:delayed", queueName)
+	ready, err := r.client.ZRangeByScore(r.ctx, delayedKey, &redis.ZRangeBy{Min: "-inf", Max: fmt.Sprintf("%d", now)}).Result()
+	if err != nil { return err }
+	for _, jobID := range ready {
+		// Remove from delayed
+		_ = r.client.ZRem(r.ctx, delayedKey, jobID).Err()
+		// Fetch job to get its priority & created time for stable ordering
+		jd, err := r.client.HGet(r.ctx, fmt.Sprintf("job:%s", jobID), "data").Result()
+		if err != nil { continue }
+		var job queue.Job
+		if err := json.Unmarshal([]byte(jd), &job); err != nil { continue }
+		// If job.AvailableAt set, treat CreatedAt as now for ordering to avoid inversion
+		enqueueTime := time.Now()
+		_ = r.client.ZAdd(r.ctx, fmt.Sprintf("jobs:%s:z", queueName), redis.Z{Score: r.scoreFor(job.Priority, enqueueTime), Member: jobID}).Err()
+		// update job timestamps
+		job.UpdatedAt = enqueueTime
+		if job.AvailableAt.After(enqueueTime) { job.AvailableAt = enqueueTime }
+		_ = r.UpdateJob(&job)
+		_ = r.appendEvent(jobID, map[string]interface{}{
+			"type": "promoted_delayed",
+			"queue": queueName,
+			"timestamp": time.Now().Unix(),
+		})
+	}
 	return nil
 }
 

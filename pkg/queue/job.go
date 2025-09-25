@@ -22,6 +22,8 @@ type Job struct {
 	Payload    string    `json:"payload"`
 	QueueName  string    `json:"queue"`
 	Priority   int       `json:"priority"`
+	AvailableAt time.Time `json:"available_at,omitempty"`
+	RecurrenceID string   `json:"recurrence_id,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 	RetryCount int       `json:"retry_count"`

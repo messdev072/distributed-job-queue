@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -26,6 +27,20 @@ func main() {
 			log.Printf("Postgres hooks init failed: %v\n", err)
 		}
 	}
+
+	// Delayed job promotion ticker
+	go func(){
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			// List queues and promote
+			queues, err := q.Client().SMembers(q.Ctx(), "queues").Result()
+			if err != nil { continue }
+			for _, name := range queues {
+				_ = q.PromoteDelayed(name)
+			}
+		}
+	}()
 
 	s := &api.Server{Q: q}
 

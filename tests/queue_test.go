@@ -187,6 +187,31 @@ func TestPriorityOrderingFIFOWithinPriority(t *testing.T) {
 	_ = q.Ack(d3)
 }
 
+func TestDelayedJobPromotion(t *testing.T) {
+	q, name := newTestQueueWithName()
+	j := queue.NewJob("delayed", name)
+	j.Priority = 5
+	j.AvailableAt = time.Now().Add(1 * time.Second)
+	_ = q.Enqueue(j)
+
+	// Should not dequeue before ready
+	if _, err := q.Dequeue(name); err == nil {
+		t.Fatalf("expected empty before delay elapsed")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	// Promote explicitly (simulating ticker)
+	if rq, ok := q.(*storage.RedisQueue); ok {
+		_ = rq.PromoteDelayed(name)
+	}
+	d, err := q.Dequeue(name)
+	if err != nil {
+		t.Fatalf("dequeue after promotion: %v", err)
+	}
+	if d.ID != j.ID {
+		t.Fatalf("expected job %s got %s", j.ID, d.ID)
+	}
+}
+
 func TestRecoverySweepDeadWorker(t *testing.T) {
 	q, name := newTestQueueWithName()
 

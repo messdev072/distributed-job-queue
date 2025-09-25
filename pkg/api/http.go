@@ -21,6 +21,7 @@ func (s *Server) EnqueueHandler(w http.ResponseWriter, r *http.Request) {
 		Queue    string `json:"queue"`
 		Payload  string `json:"payload"`
 		Priority int    `json:"priority"`
+		DelaySeconds int `json:"delay_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		logging.L().Error("enqueue decode error", zap.Error(err), zap.String("job_id", ""), zap.String("queue", body.Queue), zap.String("worker_id", ""))
@@ -30,6 +31,9 @@ func (s *Server) EnqueueHandler(w http.ResponseWriter, r *http.Request) {
 
 	job := queue.NewJob(body.Payload, body.Queue)
 	job.Priority = body.Priority
+	if body.DelaySeconds > 0 {
+		job.AvailableAt = time.Now().Add(time.Duration(body.DelaySeconds) * time.Second)
+	}
 	if err := s.Q.Enqueue(job); err != nil {
 		logging.L().Error("enqueue failed", zap.Error(err), zap.String("job_id", job.ID), zap.String("queue", body.Queue), zap.String("worker_id", ""))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
