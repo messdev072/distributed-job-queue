@@ -18,6 +18,7 @@ const (
 
 type Job struct {
 	ID           string    `json:"id"`
+	TenantID     string    `json:"tenant_id"`     // Multi-tenancy support
 	Status       Status    `json:"status"`
 	Payload      string    `json:"payload"`
 	QueueName    string    `json:"queue"`
@@ -35,6 +36,7 @@ func NewJob(payload string, queueName string) *Job {
 	now := time.Now()
 	return &Job{
 		ID:         uuid.New().String(),
+		TenantID:   "default", // Default tenant if not specified
 		Status:     StatusPending,
 		Payload:    payload,
 		QueueName:  queueName,
@@ -45,4 +47,11 @@ func NewJob(payload string, queueName string) *Job {
 		RetryCount: 0,
 		Delivery:   "at_least_once",
 	}
+}
+
+// NewJobWithTenant creates a new job with a specific tenant ID
+func NewJobWithTenant(payload string, queueName string, tenantID string) *Job {
+	job := NewJob(payload, queueName)
+	job.TenantID = tenantID
+	return job
 }

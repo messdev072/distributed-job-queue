@@ -6,6 +6,7 @@ import (
 	"distributed-job-queue/pkg/queue"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -13,10 +14,11 @@ import (
 
 // RedisBackend implements Backend interface using Redis as storage.
 type RedisBackend struct {
-	client      *redis.Client
-	ctx         context.Context
-	hooks       queue.LifecycleHooks
-	rateLimiter queue.RateLimiter
+	client        *redis.Client
+	ctx           context.Context
+	hooks         queue.LifecycleHooks
+	rateLimiter   queue.RateLimiter
+	tenantManager queue.TenantManager
 }
 
 func NewRedisBackend(addr string) *RedisBackend {
@@ -512,6 +514,170 @@ func (r *RedisBackend) SetRateLimiter(limiter queue.RateLimiter) {
 // GetRateLimiter returns the current rate limiter.
 func (r *RedisBackend) GetRateLimiter() queue.RateLimiter {
 	return r.rateLimiter
+}
+
+// SetTenantManager sets the tenant manager for this backend.
+func (r *RedisBackend) SetTenantManager(manager queue.TenantManager) {
+	r.tenantManager = manager
+}
+
+// GetTenantManager returns the current tenant manager.
+func (r *RedisBackend) GetTenantManager() queue.TenantManager {
+	return r.tenantManager
+}
+
+// EnqueueTenant enqueues a job for a specific tenant
+func (r *RedisBackend) EnqueueTenant(job *queue.Job, tenantID string) error {
+	// Set tenant ID on job
+	job.TenantID = tenantID
+
+	// Check quotas if tenant manager is available
+	if r.tenantManager != nil {
+		if err := r.tenantManager.CheckQuotas(r.ctx, tenantID, job); err != nil {
+			return err
+		}
+	}
+
+	// Use tenant-specific keyspace
+	tenantKeyspace := "tenant:" + tenantID
+	
+	// Store job metadata with tenant context
+	data, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	
+	jobKey := fmt.Sprintf("%s:job:%s", tenantKeyspace, job.ID)
+	if err := r.client.HSet(r.ctx, jobKey, "data", data).Err(); err != nil {
+		return err
+	}
+
+	// Use tenant-specific queue key
+	queueKey := fmt.Sprintf("%s:jobs:%s:z", tenantKeyspace, job.QueueName)
+	
+	// Add to sorted set with priority as score
+	score := float64(job.Priority)
+	if err := r.client.ZAdd(r.ctx, queueKey, redis.Z{
+		Score:  score,
+		Member: job.ID,
+	}).Err(); err != nil {
+		return err
+	}
+
+	// Update tenant usage
+	if r.tenantManager != nil {
+		delta := queue.TenantUsageDelta{
+			JobsDelta:        1,
+			QueueLengthDelta: 1,
+		}
+		r.tenantManager.UpdateUsage(r.ctx, tenantID, delta)
+	}
+
+	// Call hooks
+	r.hooks.OnEnqueue(r.ctx, job)
+
+	return nil
+}
+
+// DequeueTenant dequeues a job from a specific tenant's queue
+func (r *RedisBackend) DequeueTenant(queueName string, tenantID string, workerID string, visibility time.Duration) (*queue.Job, error) {
+	tenantKeyspace := "tenant:" + tenantID
+	queueKey := fmt.Sprintf("%s:jobs:%s:z", tenantKeyspace, queueName)
+	
+	// Check if any jobs are available
+	results, err := r.client.ZRevRangeWithScores(r.ctx, queueKey, 0, 0).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil // No jobs available
+	}
+
+	// Pop the highest priority job
+	jobID := results[0].Member.(string)
+	
+	// Remove from queue atomically
+	removed, err := r.client.ZRem(r.ctx, queueKey, jobID).Result()
+	if err != nil {
+		return nil, err
+	}
+	if removed == 0 {
+		return nil, nil // Job was already taken by another worker
+	}
+
+	// Get job data
+	jobKey := fmt.Sprintf("%s:job:%s", tenantKeyspace, jobID)
+	jobData, err := r.client.HGet(r.ctx, jobKey, "data").Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, fmt.Errorf("job %s not found", jobID)
+		}
+		return nil, err
+	}
+
+	var job queue.Job
+	if err := json.Unmarshal([]byte(jobData), &job); err != nil {
+		return nil, err
+	}
+
+	// Update job status
+	job.Status = queue.StatusRunning
+	job.UpdatedAt = time.Now()
+
+	// Store in processing set with visibility timeout
+	processingKey := fmt.Sprintf("%s:processing:%s", tenantKeyspace, queueName)
+	expirationTime := time.Now().Add(visibility).Unix()
+	
+	err = r.client.ZAdd(r.ctx, processingKey, redis.Z{
+		Score:  float64(expirationTime),
+		Member: jobID,
+	}).Err()
+	if err != nil {
+		return nil, err
+	}
+
+	// Update job metadata
+	updatedData, _ := json.Marshal(job)
+	r.client.HSet(r.ctx, jobKey, "data", updatedData)
+
+	// Update tenant usage
+	if r.tenantManager != nil {
+		delta := queue.TenantUsageDelta{
+			QueueLengthDelta: -1,
+		}
+		r.tenantManager.UpdateUsage(r.ctx, tenantID, delta)
+	}
+
+	// Note: No OnDequeue hook exists, jobs are handled when they're processed
+
+	return &job, nil
+}
+
+// ListTenantQueues returns a list of queues for a specific tenant
+func (r *RedisBackend) ListTenantQueues(tenantID string) ([]string, error) {
+	pattern := fmt.Sprintf("tenant:%s:jobs:*:z", tenantID)
+	keys, err := r.client.Keys(r.ctx, pattern).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var queues []string
+	for _, key := range keys {
+		// Extract queue name from key: tenant:ID:jobs:QUEUE:z
+		parts := strings.Split(key, ":")
+		if len(parts) >= 4 {
+			queueName := parts[3]
+			queues = append(queues, queueName)
+		}
+	}
+
+	return queues, nil
+}
+
+// GetTenantQueueLength returns the length of a specific tenant's queue
+func (r *RedisBackend) GetTenantQueueLength(queueName string, tenantID string) (int64, error) {
+	queueKey := fmt.Sprintf("tenant:%s:jobs:%s:z", tenantID, queueName)
+	return r.client.ZCard(r.ctx, queueKey).Result()
 }
 
 func (r *RedisQueue) UpdateJob(job *queue.Job) error {

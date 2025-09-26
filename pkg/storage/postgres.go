@@ -14,9 +14,10 @@ import (
 
 // PostgresBackend implements Backend interface using PostgreSQL for job storage.
 type PostgresBackend struct {
-	pool        *pgxpool.Pool
-	hooks       queue.LifecycleHooks
-	rateLimiter queue.RateLimiter
+	pool          *pgxpool.Pool
+	hooks         queue.LifecycleHooks
+	rateLimiter   queue.RateLimiter
+	tenantManager queue.TenantManager
 }
 
 // NewPostgresBackend creates a new PostgreSQL backend.
@@ -43,10 +44,11 @@ func NewPostgresBackend(dsn string) (*PostgresBackend, error) {
 func (p *PostgresBackend) initTables() error {
 	ctx := context.Background()
 
-	// Main jobs table with all job metadata
+	// Main jobs table with all job metadata including tenant support
 	_, err := p.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS jobs (
 			id VARCHAR(255) PRIMARY KEY,
+			tenant_id VARCHAR(255) NOT NULL DEFAULT 'default',
 			queue_name VARCHAR(255) NOT NULL,
 			status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
 			payload TEXT NOT NULL,
@@ -66,15 +68,21 @@ func (p *PostgresBackend) initTables() error {
 		return fmt.Errorf("failed to create jobs table: %w", err)
 	}
 
-	// Create indexes for jobs table
-	_, err = p.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_queue_status ON jobs (queue_name, status)`)
+	// Create indexes for jobs table with tenant support
+	_, err = p.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_tenant_queue_status ON jobs (tenant_id, queue_name, status)`)
 	if err != nil {
-		return fmt.Errorf("failed to create jobs queue status index: %w", err)
+		return fmt.Errorf("failed to create jobs tenant queue status index: %w", err)
 	}
 
-	_, err = p.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_queue_priority_created ON jobs (queue_name, status, priority DESC, created_at ASC)`)
+	_, err = p.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_tenant_queue_priority ON jobs (tenant_id, queue_name, status, priority DESC, created_at ASC)`)
 	if err != nil {
-		return fmt.Errorf("failed to create jobs priority index: %w", err)
+		return fmt.Errorf("failed to create jobs tenant priority index: %w", err)
+	}
+
+	// Add tenant_id column to existing tables if not present (migration)
+	_, err = p.pool.Exec(ctx, `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(255) NOT NULL DEFAULT 'default'`)
+	if err != nil {
+		return fmt.Errorf("failed to add tenant_id column: %w", err)
 	}
 
 	_, err = p.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_available_at ON jobs (available_at)`)
@@ -741,4 +749,175 @@ func (p *PostgresBackend) SetRateLimiter(limiter queue.RateLimiter) {
 // GetRateLimiter returns the current rate limiter.
 func (p *PostgresBackend) GetRateLimiter() queue.RateLimiter {
 	return p.rateLimiter
+}
+
+// SetTenantManager sets the tenant manager for this backend.
+func (p *PostgresBackend) SetTenantManager(manager queue.TenantManager) {
+	p.tenantManager = manager
+}
+
+// GetTenantManager returns the current tenant manager.
+func (p *PostgresBackend) GetTenantManager() queue.TenantManager {
+	return p.tenantManager
+}
+
+// EnqueueTenant enqueues a job for a specific tenant
+func (p *PostgresBackend) EnqueueTenant(job *queue.Job, tenantID string) error {
+	// Set tenant ID on job
+	job.TenantID = tenantID
+
+	// Check quotas if tenant manager is available
+	if p.tenantManager != nil {
+		if err := p.tenantManager.CheckQuotas(context.Background(), tenantID, job); err != nil {
+			return err
+		}
+	}
+
+	ctx := context.Background()
+
+	// Insert job with tenant ID
+	query := `
+		INSERT INTO jobs (
+			id, tenant_id, queue_name, status, payload, priority, delivery, 
+			available_at, recurrence_id, created_at, updated_at, retry_count, max_retries
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`
+
+	_, err := p.pool.Exec(ctx, query,
+		job.ID, job.TenantID, job.QueueName, job.Status, job.Payload, job.Priority,
+		job.Delivery, job.AvailableAt, job.RecurrenceID, job.CreatedAt, job.UpdatedAt,
+		job.RetryCount, job.MaxRetries,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to enqueue job: %w", err)
+	}
+
+	// Update tenant usage
+	if p.tenantManager != nil {
+		delta := queue.TenantUsageDelta{
+			JobsDelta:        1,
+			QueueLengthDelta: 1,
+		}
+		p.tenantManager.UpdateUsage(ctx, tenantID, delta)
+	}
+
+	// Call hooks
+	p.hooks.OnEnqueue(ctx, job)
+
+	return nil
+}
+
+// DequeueTenant dequeues a job from a specific tenant's queue
+func (p *PostgresBackend) DequeueTenant(queueName string, tenantID string, workerID string, visibility time.Duration) (*queue.Job, error) {
+	ctx := context.Background()
+
+	// Use a transaction to atomically claim a job
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Find and claim the highest priority job for this tenant
+	query := `
+		UPDATE jobs 
+		SET status = 'RUNNING', 
+			processing_until = $1,
+			worker_id = $2,
+			updated_at = NOW()
+		WHERE id = (
+			SELECT id FROM jobs 
+			WHERE tenant_id = $3 
+			  AND queue_name = $4 
+			  AND status = 'PENDING'
+			  AND (available_at IS NULL OR available_at <= NOW())
+			ORDER BY priority DESC, created_at ASC
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, tenant_id, queue_name, status, payload, priority, delivery,
+				  available_at, recurrence_id, created_at, updated_at, retry_count, max_retries
+	`
+
+	processingUntil := time.Now().Add(visibility)
+	var job queue.Job
+
+	err = tx.QueryRow(ctx, query, processingUntil, workerID, tenantID, queueName).Scan(
+		&job.ID, &job.TenantID, &job.QueueName, &job.Status, &job.Payload, &job.Priority,
+		&job.Delivery, &job.AvailableAt, &job.RecurrenceID, &job.CreatedAt, &job.UpdatedAt,
+		&job.RetryCount, &job.MaxRetries,
+	)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil // No jobs available
+		}
+		return nil, fmt.Errorf("failed to dequeue job: %w", err)
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit dequeue transaction: %w", err)
+	}
+
+	// Update tenant usage
+	if p.tenantManager != nil {
+		delta := queue.TenantUsageDelta{
+			QueueLengthDelta: -1,
+		}
+		p.tenantManager.UpdateUsage(ctx, tenantID, delta)
+	}
+
+	return &job, nil
+}
+
+// ListTenantQueues returns a list of queues for a specific tenant
+func (p *PostgresBackend) ListTenantQueues(tenantID string) ([]string, error) {
+	ctx := context.Background()
+
+	query := `
+		SELECT DISTINCT queue_name 
+		FROM jobs 
+		WHERE tenant_id = $1 
+		ORDER BY queue_name
+	`
+
+	rows, err := p.pool.Query(ctx, query, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tenant queues: %w", err)
+	}
+	defer rows.Close()
+
+	var queues []string
+	for rows.Next() {
+		var queueName string
+		if err := rows.Scan(&queueName); err != nil {
+			return nil, fmt.Errorf("failed to scan queue name: %w", err)
+		}
+		queues = append(queues, queueName)
+	}
+
+	return queues, nil
+}
+
+// GetTenantQueueLength returns the length of a specific tenant's queue
+func (p *PostgresBackend) GetTenantQueueLength(queueName string, tenantID string) (int64, error) {
+	ctx := context.Background()
+
+	query := `
+		SELECT COUNT(*) 
+		FROM jobs 
+		WHERE tenant_id = $1 
+		  AND queue_name = $2 
+		  AND status = 'PENDING'
+	`
+
+	var count int64
+	err := p.pool.QueryRow(ctx, query, tenantID, queueName).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get tenant queue length: %w", err)
+	}
+
+	return count, nil
 }

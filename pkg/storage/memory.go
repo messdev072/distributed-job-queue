@@ -13,15 +13,20 @@ import (
 
 // MemoryBackend implements Backend interface using in-memory storage for testing.
 type MemoryBackend struct {
-	mu          sync.RWMutex
-	jobs        map[string]*queue.Job
-	queues      map[string]*memoryQueue
-	hooks       queue.LifecycleHooks
-	events      map[string][]map[string]interface{}
-	dedupe      map[string]string // dedupe key -> job ID
-	idempotency map[string]string // idempotency key -> result
-	ownership   map[string]string // job ID -> worker ID
-	rateLimiter queue.RateLimiter
+	mu            sync.RWMutex
+	jobs          map[string]*queue.Job
+	queues        map[string]*memoryQueue
+	hooks         queue.LifecycleHooks
+	events        map[string][]map[string]interface{}
+	dedupe        map[string]string // dedupe key -> job ID
+	idempotency   map[string]string // idempotency key -> result
+	ownership     map[string]string // job ID -> worker ID
+	rateLimiter   queue.RateLimiter
+	tenantManager queue.TenantManager
+
+	// Tenant-specific storage
+	tenantJobs   map[string]map[string]*queue.Job   // tenant -> job ID -> job
+	tenantQueues map[string]map[string]*memoryQueue // tenant -> queue name -> queue
 }
 
 type memoryQueue struct {
@@ -44,14 +49,16 @@ type delayedJob struct {
 
 func NewMemoryBackend() *MemoryBackend {
 	return &MemoryBackend{
-		jobs:        make(map[string]*queue.Job),
-		queues:      make(map[string]*memoryQueue),
-		hooks:       queue.NoopHooks{},
-		events:      make(map[string][]map[string]interface{}),
-		dedupe:      make(map[string]string),
-		rateLimiter: queue.NoopRateLimiter{},
-		idempotency: make(map[string]string),
-		ownership:   make(map[string]string),
+		jobs:         make(map[string]*queue.Job),
+		queues:       make(map[string]*memoryQueue),
+		hooks:        queue.NoopHooks{},
+		events:       make(map[string][]map[string]interface{}),
+		tenantJobs:   make(map[string]map[string]*queue.Job),
+		tenantQueues: make(map[string]map[string]*memoryQueue),
+		dedupe:       make(map[string]string),
+		rateLimiter:  queue.NoopRateLimiter{},
+		idempotency:  make(map[string]string),
+		ownership:    make(map[string]string),
 	}
 }
 
@@ -421,7 +428,7 @@ func (m *MemoryBackend) appendEvent(jobID string, evt map[string]interface{}) {
 func (m *MemoryBackend) SetRateLimiter(limiter queue.RateLimiter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	if limiter == nil {
 		m.rateLimiter = queue.NoopRateLimiter{}
 		return
@@ -433,6 +440,170 @@ func (m *MemoryBackend) SetRateLimiter(limiter queue.RateLimiter) {
 func (m *MemoryBackend) GetRateLimiter() queue.RateLimiter {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	return m.rateLimiter
+}
+
+// SetTenantManager sets the tenant manager for this backend.
+func (m *MemoryBackend) SetTenantManager(manager queue.TenantManager) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tenantManager = manager
+}
+
+// GetTenantManager returns the current tenant manager.
+func (m *MemoryBackend) GetTenantManager() queue.TenantManager {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.tenantManager
+}
+
+// EnqueueTenant enqueues a job for a specific tenant
+func (m *MemoryBackend) EnqueueTenant(job *queue.Job, tenantID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Set tenant ID on job
+	job.TenantID = tenantID
+
+	// Check quotas if tenant manager is available
+	if m.tenantManager != nil {
+		if err := m.tenantManager.CheckQuotas(context.Background(), tenantID, job); err != nil {
+			return err
+		}
+	}
+
+	// Initialize tenant storage if needed
+	if m.tenantJobs[tenantID] == nil {
+		m.tenantJobs[tenantID] = make(map[string]*queue.Job)
+		m.tenantQueues[tenantID] = make(map[string]*memoryQueue)
+	}
+
+	// Store job
+	m.tenantJobs[tenantID][job.ID] = job
+
+	// Add to tenant queue
+	if m.tenantQueues[tenantID][job.QueueName] == nil {
+		m.tenantQueues[tenantID][job.QueueName] = &memoryQueue{
+			ready:      make([]*queuedJob, 0),
+			processing: make(map[string]time.Time),
+			delayed:    make([]*delayedJob, 0),
+			dlq:        make([]string, 0),
+		}
+	}
+
+	tenantQueue := m.tenantQueues[tenantID][job.QueueName]
+
+	// Handle delayed jobs
+	if !job.AvailableAt.IsZero() && job.AvailableAt.After(time.Now()) {
+		tenantQueue.delayed = append(tenantQueue.delayed, &delayedJob{
+			JobID:     job.ID,
+			ReadyTime: job.AvailableAt,
+		})
+	} else {
+		// Add to ready queue
+		tenantQueue.ready = append(tenantQueue.ready, &queuedJob{
+			JobID:       job.ID,
+			Priority:    job.Priority,
+			EnqueueTime: time.Now(),
+		})
+
+		// Sort by priority (higher priority first)
+		sort.Slice(tenantQueue.ready, func(i, j int) bool {
+			return tenantQueue.ready[i].Priority > tenantQueue.ready[j].Priority
+		})
+	}
+
+	// Update tenant usage
+	if m.tenantManager != nil {
+		delta := queue.TenantUsageDelta{
+			JobsDelta:        1,
+			QueueLengthDelta: 1,
+		}
+		m.tenantManager.UpdateUsage(context.Background(), tenantID, delta)
+	}
+
+	// Call hooks
+	m.hooks.OnEnqueue(context.Background(), job)
+
+	return nil
+}
+
+// DequeueTenant dequeues a job from a specific tenant's queue
+func (m *MemoryBackend) DequeueTenant(queueName string, tenantID string, workerID string, visibility time.Duration) (*queue.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if tenant has any jobs
+	if m.tenantJobs[tenantID] == nil || m.tenantQueues[tenantID] == nil {
+		return nil, nil // No jobs for this tenant
+	}
+
+	tenantQueue, exists := m.tenantQueues[tenantID][queueName]
+	if !exists || len(tenantQueue.ready) == 0 {
+		return nil, nil // No jobs in this queue
+	}
+
+	// Get the highest priority job
+	queuedJob := tenantQueue.ready[0]
+	tenantQueue.ready = tenantQueue.ready[1:]
+
+	// Get job details
+	job, exists := m.tenantJobs[tenantID][queuedJob.JobID]
+	if !exists {
+		return nil, errors.New("job not found")
+	}
+
+	// Update job status
+	job.Status = queue.StatusRunning
+	job.UpdatedAt = time.Now()
+
+	// Add to processing with visibility timeout
+	deadline := time.Now().Add(visibility)
+	tenantQueue.processing[job.ID] = deadline
+	m.ownership[job.ID] = workerID
+
+	// Update tenant usage
+	if m.tenantManager != nil {
+		delta := queue.TenantUsageDelta{
+			QueueLengthDelta: -1,
+		}
+		m.tenantManager.UpdateUsage(context.Background(), tenantID, delta)
+	}
+
+	return job, nil
+}
+
+// ListTenantQueues returns a list of queues for a specific tenant
+func (m *MemoryBackend) ListTenantQueues(tenantID string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.tenantQueues[tenantID] == nil {
+		return []string{}, nil
+	}
+
+	var queues []string
+	for queueName := range m.tenantQueues[tenantID] {
+		queues = append(queues, queueName)
+	}
+
+	return queues, nil
+}
+
+// GetTenantQueueLength returns the length of a specific tenant's queue
+func (m *MemoryBackend) GetTenantQueueLength(queueName string, tenantID string) (int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.tenantQueues[tenantID] == nil {
+		return 0, nil
+	}
+
+	tenantQueue, exists := m.tenantQueues[tenantID][queueName]
+	if !exists {
+		return 0, nil
+	}
+
+	return int64(len(tenantQueue.ready)), nil
 }
