@@ -1,0 +1,91 @@
+# Distributed Job Queue
+
+# Binaries
+/server
+/worker
+*.exe
+
+# Go build cache
+.go-build-cache/
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+logs/
+log/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker
+.dockerignore
+
+# Config files (keep examples)
+config.yml
+config.yaml
+!config.example.yml
+!config.example.yaml
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Local development
+local/
+dev/
+development/
+
+# Vendor directory (if using vendoring)
+vendor/
+
+# Test artifacts
+test-results/
+junit.xml
+
+# Performance test results
+*.prof
+*.trace
+
+# Documentation build
+docs/_build/
+docs/site/
+
+# Backup files
+*.bak
+*.backup

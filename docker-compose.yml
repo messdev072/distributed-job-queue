@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  # Redis for high-performance backend
+  redis:
+    image: redis:7-alpine
+    container_name: job-queue-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # PostgreSQL for production-grade persistence
+  postgres:
+    image: postgres:15-alpine
+    container_name: job-queue-postgres
+    environment:
+      POSTGRES_DB: jobqueue
+      POSTGRES_USER: jobqueue
+      POSTGRES_PASSWORD: jobqueue_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobqueue"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Job Queue Server with Redis backend
+  job-queue-server:
+    build: .
+    container_name: job-queue-server
+    ports:
+      - "8080:8080"
+    environment:
+      - BACKEND=redis
+      - REDIS_URL=redis://redis:6379
+      - PORT=8080
+      - LOG_LEVEL=info
+      - RATE_LIMIT_ENABLED=true
+      - TENANT_ISOLATION_ENABLED=true
+      - ADMIN_API_ENABLED=true
+      - WORKER_CONCURRENCY=20
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Job Queue Worker instances
+  job-queue-worker-1:
+    build: .
+    container_name: job-queue-worker-1
+    command: ["./worker"]
+    environment:
+      - BACKEND=redis
+      - REDIS_URL=redis://redis:6379
+      - WORKER_ID=worker-1
+      - LOG_LEVEL=info
+      - WORKER_CONCURRENCY=10
+    depends_on:
+      redis:
+        condition: service_healthy
+      job-queue-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  job-queue-worker-2:
+    build: .
+    container_name: job-queue-worker-2
+    command: ["./worker"]
+    environment:
+      - BACKEND=redis
+      - REDIS_URL=redis://redis:6379
+      - WORKER_ID=worker-2
+      - LOG_LEVEL=info
+      - WORKER_CONCURRENCY=10
+    depends_on:
+      redis:
+        condition: service_healthy
+      job-queue-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Alternative: PostgreSQL backend setup (uncomment to use)
+  # job-queue-server-postgres:
+  #   build: .
+  #   container_name: job-queue-server-postgres
+  #   ports:
+  #     - "8081:8080"
+  #   environment:
+  #     - BACKEND=postgres
+  #     - POSTGRES_DSN=postgres://jobqueue:jobqueue_password@postgres:5432/jobqueue?sslmode=disable
+  #     - PORT=8080
+  #     - LOG_LEVEL=info
+  #     - RATE_LIMIT_ENABLED=true
+  #     - TENANT_ISOLATION_ENABLED=true
+  #     - POSTGRES_MAX_CONNS=25
+  #     - POSTGRES_MIN_CONNS=5
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:
+
+networks:
+  default:
+    name: job-queue-network

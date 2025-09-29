@@ -1,0 +1,12 @@
+{
+    "queue_name": "email-processing",
+    "payload": "{\"email\": \"user@example.com\", \"template\": \"welcome\", \"variables\": {\"name\": \"John Doe\", \"company\": \"Acme Corp\"}}",
+    "priority": 5,
+    "max_retries": 3,
+    "delivery": "at_least_once",
+    "metadata": {
+        "source": "signup_flow",
+        "campaign_id": "welcome_series_v2",
+        "user_segment": "enterprise"
+    }
+}
